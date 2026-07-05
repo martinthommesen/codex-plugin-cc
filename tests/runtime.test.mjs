@@ -3,6 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
@@ -14,6 +15,8 @@ import {
   seedStateFixture,
   writeJobFixture
 } from "./helpers.mjs";
+import { createBrokerSocketHandler } from "../plugins/codex/scripts/app-server-broker.mjs";
+import { BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -33,6 +36,47 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+class BrokerTestSocket extends EventEmitter {
+  constructor() {
+    super();
+    this.destroyed = false;
+    this.output = "";
+  }
+
+  setEncoding() {}
+
+  write(chunk) {
+    if (!this.destroyed) {
+      this.output += String(chunk);
+    }
+  }
+
+  end() {
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+    this.emit("close");
+  }
+
+  receive(message) {
+    this.emit("data", `${JSON.stringify(message)}\n`);
+  }
+
+  message(id) {
+    return this.output
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .find((message) => message.id === id) ?? null;
+  }
+}
+
+async function brokerRequest(socket, message) {
+  socket.receive(message);
+  return waitFor(() => socket.message(message.id));
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -909,6 +953,120 @@ test("task using the shared broker still completes when Codex spawns subagents",
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+});
+
+test("brokered app-server errors expose the child stderr tail on the broker client", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-errors-with-stderr");
+  initGitRepo(repo);
+
+  const env = buildEnv(binDir);
+  let appClient = null;
+  try {
+    appClient = await CodexAppServerClient.connect(repo, { env, disableBroker: true });
+    const socket = new BrokerTestSocket();
+    createBrokerSocketHandler(appClient).attach(socket);
+
+    const threadResponse = await brokerRequest(socket, {
+      id: 1,
+      method: "thread/start",
+      params: {
+        cwd: repo,
+        model: null,
+        sandbox: "read-only",
+        ephemeral: true
+      }
+    });
+    const threadId = threadResponse.result.thread.id;
+
+    const turnResponse = await brokerRequest(socket, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [{ type: "text", text: "FAIL_THIS_TURN" }],
+        model: null,
+        effort: null,
+        outputSchema: null
+      }
+    });
+
+    assert.equal(turnResponse.error.message, "turn/start failed with stderr");
+    assert.match(turnResponse.error.data.stderr, /broker stderr tail marker/);
+    assert.doesNotMatch(turnResponse.error.data.stderr, /broker stderr head marker/);
+
+    const brokerClient = new BrokerCodexAppServerClient(repo, { brokerEndpoint: "unix:/unused.sock" });
+    const rejection = new Promise((resolve, reject) => {
+      brokerClient.pending.set(2, { resolve, reject, method: "turn/start" });
+      brokerClient.handleLine(JSON.stringify(turnResponse));
+    });
+    await assert.rejects(
+      rejection,
+      (error) => {
+        assert.match(error.message, /turn\/start failed with stderr/);
+        assert.match(error.data?.data?.stderr ?? "", /broker stderr tail marker/);
+        return true;
+      }
+    );
+    assert.equal(brokerClient.stderr, turnResponse.error.data.stderr);
+  } finally {
+    await appClient?.close().catch(() => {});
+  }
+});
+
+test("broker interrupts an active turn when the owning client disconnects", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-delayed-turn-start");
+  initGitRepo(repo);
+
+  const env = buildEnv(binDir);
+  let appClient = null;
+  try {
+    appClient = await CodexAppServerClient.connect(repo, { env, disableBroker: true });
+    const socket = new BrokerTestSocket();
+    createBrokerSocketHandler(appClient).attach(socket);
+
+    const threadResponse = await brokerRequest(socket, {
+      id: 1,
+      method: "thread/start",
+      params: {
+        cwd: repo,
+        model: null,
+        sandbox: "workspace-write",
+        ephemeral: true
+      }
+    });
+    const threadId = threadResponse.result.thread.id;
+    socket.receive({
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [{ type: "text", text: "keep working until interrupted" }],
+        model: null,
+        effort: null,
+        outputSchema: null
+      }
+    });
+    const startedTurn = await waitFor(() => {
+      const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      return fakeState.lastTurnStart ?? null;
+    });
+
+    socket.end();
+
+    const interrupt = await waitFor(() => {
+      const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      return fakeState.lastInterrupt ?? null;
+    });
+
+    assert.deepEqual(interrupt, { threadId, turnId: startedTurn.turnId });
+  } finally {
+    await appClient?.close().catch(() => {});
+  }
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {

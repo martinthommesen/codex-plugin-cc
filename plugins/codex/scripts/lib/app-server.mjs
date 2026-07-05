@@ -142,6 +142,9 @@ class AppServerClientBase {
       this.pending.delete(message.id);
 
       if (message.error) {
+        if (this.transport === "broker" && typeof message.error?.data?.stderr === "string") {
+          this.stderr = message.error.data.stderr;
+        }
         pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
       } else {
         pending.resolve(message.result ?? {});
@@ -277,7 +280,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 }
 
-class BrokerCodexAppServerClient extends AppServerClientBase {
+export class BrokerCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "broker";
