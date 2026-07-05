@@ -2140,10 +2140,7 @@ test("broker process log file is created private", { skip: process.platform === 
     logFile
   });
 
-  await new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("exit", resolve);
-  });
+  await waitFor(() => child.exitCode !== null || child.signalCode !== null);
 
   const mode = fs.statSync(logFile).mode & 0o777;
   assert.equal(mode, 0o600, `broker log should be 0600, got ${mode.toString(8)}`);
