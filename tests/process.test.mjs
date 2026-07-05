@@ -75,6 +75,14 @@ test("resolveExecutable prefers a real .exe over a .cmd on the Windows PATH", ()
   assert.equal(resolveExecutable("git", { platform: "win32", env }), path.join(dir, "git.exe"));
 });
 
+test("resolveExecutable ignores matching directories on the Windows PATH", () => {
+  const dir = makeTempDir();
+  fs.mkdirSync(path.join(dir, "git.exe"));
+  fs.writeFileSync(path.join(dir, "git.cmd"), "");
+  const env = { PATH: dir, PATHEXT: ".exe;.cmd" };
+  assert.equal(resolveExecutable("git", { platform: "win32", env }), path.join(dir, "git.cmd"));
+});
+
 test("spawnConfigFor: a real Windows exe runs shell-free, a .cmd shim runs through a shell", () => {
   const dir = makeTempDir();
   fs.writeFileSync(path.join(dir, "git.exe"), "");

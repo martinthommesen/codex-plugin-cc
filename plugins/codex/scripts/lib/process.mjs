@@ -3,6 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+function isFile(candidate) {
+  try {
+    return fs.statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
 // On Windows, spawn() without a shell needs the exact executable path and cannot
 // run .cmd/.bat scripts at all. Resolve `command` against PATH + PATHEXT so real
 // executables (git.exe, taskkill.exe) run shell-free — their args then reach the
@@ -18,7 +26,7 @@ export function resolveExecutable(command, { platform = process.platform, env = 
   for (const dir of (env.PATH || "").split(";").filter(Boolean)) {
     for (const ext of exts) {
       const candidate = path.join(dir, `${command}${ext}`);
-      if (fs.existsSync(candidate)) {
+      if (isFile(candidate)) {
         return candidate;
       }
     }
