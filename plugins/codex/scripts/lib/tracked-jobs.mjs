@@ -2,8 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
-
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+import { SESSION_ID_ENV } from "./constants.mjs";
 
 export function nowIso() {
   return new Date().toISOString();

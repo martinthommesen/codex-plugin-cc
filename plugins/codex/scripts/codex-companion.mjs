@@ -7,6 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { STOP_REVIEW_TASK_MARKER } from "./lib/constants.mjs";
 import {
     ADVISOR_THREAD_PREFIX,
     buildPersistentThreadName,
@@ -25,6 +26,7 @@ import {
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
+import { shorten } from "./lib/text.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -39,6 +41,8 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  filterJobsForCurrentSession,
+  getCurrentSessionId,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -51,8 +55,7 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
-  runTrackedJob,
-  SESSION_ID_ENV
+  runTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
@@ -73,7 +76,6 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
   console.log(
@@ -162,17 +164,6 @@ function resolveCommandWorkspace(options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
 }
 
 function firstMeaningfulLine(text, fallback) {
@@ -295,18 +286,6 @@ function isActiveJobStatus(status) {
   return status === "queued" || status === "running";
 }
 
-function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
-}
-
-function filterJobsForCurrentClaudeSession(jobs) {
-  const sessionId = getCurrentClaudeSessionId();
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
-}
-
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
@@ -339,9 +318,9 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
+  const sessionId = getCurrentSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
+  const visibleJobs = filterJobsForCurrentSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
@@ -361,7 +340,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
 async function resolveAdvisorThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = filterJobsForCurrentClaudeSession(
+  const jobs = filterJobsForCurrentSession(
     sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId)
   );
   // Any ask job with a threadId counts, including stuck "running" records: a killed
@@ -372,7 +351,7 @@ async function resolveAdvisorThread(cwd, options = {}) {
     return { id: trackedAsk.threadId, matchedByName: false };
   }
 
-  if (getCurrentClaudeSessionId()) {
+  if (getCurrentSessionId()) {
     return null;
   }
 
@@ -634,21 +613,10 @@ function renderQueuedTaskLaunch(payload) {
   return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
 }
 
-function getJobKindLabel(kind, jobClass) {
-  if (kind === "adversarial-review") {
-    return "adversarial-review";
-  }
-  if (jobClass === "review") {
-    return "review";
-  }
-  return jobClass === "ask" ? "ask" : "task";
-}
-
 function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
-    kindLabel: getJobKindLabel(kind, jobClass),
     title,
     workspaceRoot,
     jobClass,
@@ -1064,8 +1032,8 @@ function handleTaskResumeCandidate(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const sessionId = getCurrentSessionId();
+  const jobs = filterJobsForCurrentSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {

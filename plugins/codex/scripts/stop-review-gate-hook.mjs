@@ -9,14 +9,13 @@ import { fileURLToPath } from "node:url";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
-import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { filterJobsForCurrentSession, getJobTypeLabel, sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { SESSION_ID_ENV } from "./lib/constants.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -35,14 +34,6 @@ function logNote(message) {
     return;
   }
   process.stderr.write(`${message}\n`);
-}
-
-function filterJobsForCurrentSession(jobs, input = {}) {
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
 }
 
 function buildStopReviewPrompt(input = {}) {
@@ -139,27 +130,15 @@ function runStopReview(cwd, input = {}) {
   }
 }
 
-function runningJobLabel(job) {
-  const kind = job.jobClass ?? job.kind;
-  if (kind === "ask") {
-    return "ask";
-  }
-  if (kind === "review") {
-    return "review";
-  }
-  return "task";
-}
-
 function main() {
   const input = readHookInput();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
 
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), { input }));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
-  // Ignore kindLabel: it is snapshotted at job creation and may carry stale naming.
-  const jobLabel = runningJob ? runningJobLabel(runningJob) : null;
+  const jobLabel = runningJob ? getJobTypeLabel(runningJob) : null;
   const runningJobNote = runningJob
     ? `Codex ${jobLabel} ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;

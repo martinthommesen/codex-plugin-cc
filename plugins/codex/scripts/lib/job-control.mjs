@@ -1,8 +1,9 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
+import { SESSION_ID_ENV } from "./constants.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { looksLikeVerificationCommand } from "./text.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
@@ -12,11 +13,20 @@ export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
-function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
+// Single source of truth for "which session owns this job", used by the CLI,
+// the status/cancel readers, and the stop hook. Resolution precedence:
+// explicit id → hook input → an injected env → the ambient process env.
+export function getCurrentSessionId(options = {}) {
+  return (
+    options.sessionId ||
+    options.input?.session_id ||
+    options.env?.[SESSION_ID_ENV] ||
+    process.env[SESSION_ID_ENV] ||
+    null
+  );
 }
 
-function filterJobsForCurrentSession(jobs, options = {}) {
+export function filterJobsForCurrentSession(jobs, options = {}) {
   const sessionId = getCurrentSessionId(options);
   if (!sessionId) {
     return jobs;
@@ -24,12 +34,15 @@ function filterJobsForCurrentSession(jobs, options = {}) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
-function getJobTypeLabel(job) {
-  if (typeof job.kindLabel === "string" && job.kindLabel) {
-    return job.kindLabel;
-  }
+// Derives the display label purely from jobClass/kind. Deliberately ignores any
+// persisted `kindLabel` — that field was snapshotted at creation and drifted
+// (a stop-review job was stamped "task"); the label is now computed fresh.
+export function getJobTypeLabel(job) {
   if (job.kind === "adversarial-review") {
     return "adversarial-review";
+  }
+  if (job.jobClass === "stop-review") {
+    return "stop-review";
   }
   if (job.jobClass === "review") {
     return "review";
@@ -104,12 +117,6 @@ function formatElapsedDuration(startValue, endValue = null) {
     return `${minutes}m ${seconds}s`;
   }
   return `${seconds}s`;
-}
-
-function looksLikeVerificationCommand(line) {
-  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
-    line
-  );
 }
 
 function inferLegacyJobPhase(job, progressPreview = []) {
