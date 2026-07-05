@@ -709,3 +709,7 @@ export function buildHomeEnv(home) {
     USERPROFILE: home
   };
 }
+
+export function installNodeShim(binDir) {
+  fs.symlinkSync(process.execPath, path.join(binDir, process.platform === "win32" ? "node.exe" : "node"));
+}

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
-import { buildEnv, buildHomeEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
+import { buildEnv, buildHomeEnv, installFakeCodex, installNodeShim } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, readStateFixture, run, seedStateFixture, writeJobFixture } from "./helpers.mjs";
 import { createBrokerSocketHandler } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
@@ -94,7 +94,7 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, process.platform === "win32" ? "node.exe" : "node"));
+  installNodeShim(binDir);
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,
@@ -2599,7 +2599,7 @@ test("ask supports --json, --prompt-file, and --cwd", () => {
 test("ask preflight failure leaves a failed tracked job that result renders generically", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  installNodeShim(binDir);
   const env = {
     ...process.env,
     PATH: binDir,
