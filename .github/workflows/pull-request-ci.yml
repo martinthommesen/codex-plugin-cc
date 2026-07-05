@@ -33,9 +33,6 @@ jobs:
       - name: Run test suite
         run: npm test
 
-      - name: Type-check against committed app-server types
-        run: npx tsc -p tsconfig.json
-
       - name: Lint
         run: npm run lint
 

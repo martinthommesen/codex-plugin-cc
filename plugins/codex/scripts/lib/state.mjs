@@ -11,6 +11,7 @@ const CONFIG_FILE_NAME = "config.json";
 const LEGACY_STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const CANCEL_MARKER_SUFFIX = ".cancelled";
+const LEGACY_FALLBACK_STATE_ROOT = path.join(os.tmpdir(), "codex-companion");
 const MAX_TERMINAL_JOBS = 50;
 // A queued job that never records a worker pid within this window is treated as
 // a crashed launch and reaped by sweepJobs.
@@ -71,7 +72,7 @@ function resolveStateRoot() {
   return path.join(os.tmpdir(), `codex-companion-${USER_SCOPE.tag}`);
 }
 
-export function resolveStateDir(cwd) {
+function workspaceStateDirName(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
@@ -83,7 +84,15 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  return path.join(resolveStateRoot(), `${slug}-${hash}`);
+  return `${slug}-${hash}`;
+}
+
+function resolveStateDirForRoot(cwd, stateRoot) {
+  return path.join(stateRoot, workspaceStateDirName(cwd));
+}
+
+export function resolveStateDir(cwd) {
+  return resolveStateDirForRoot(cwd, resolveStateRoot());
 }
 
 export function resolveJobsDir(cwd) {
@@ -100,6 +109,14 @@ function lstatSafe(target) {
   } catch {
     return null;
   }
+}
+
+function isSecureExistingDir(dir) {
+  const info = lstatSafe(dir);
+  if (!info || info.isSymbolicLink() || !info.isDirectory()) {
+    return false;
+  }
+  return process.platform === "win32" || USER_SCOPE.uid == null || info.uid === USER_SCOPE.uid;
 }
 
 // Create/verify a single directory level we own. On POSIX, refuse to descend
@@ -192,9 +209,107 @@ export function writeFileAtomic(file, data, mode = 0o600) {
   }
 }
 
+// --- legacy state migration -------------------------------------------------
+
+function readJsonObject(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function legacyStateSources(cwd) {
+  const currentRoot = resolveStateRoot();
+  const currentDir = resolveStateDirForRoot(cwd, currentRoot);
+  const sources = [];
+
+  const currentStateFile = path.join(currentDir, LEGACY_STATE_FILE_NAME);
+  if (fs.existsSync(currentStateFile) && isSecureExistingDir(currentRoot) && isSecureExistingDir(currentDir)) {
+    sources.push({ stateFile: currentStateFile, stateDir: currentDir });
+  }
+
+  if (!process.env[PLUGIN_DATA_ENV] && LEGACY_FALLBACK_STATE_ROOT !== currentRoot) {
+    const dir = resolveStateDirForRoot(cwd, LEGACY_FALLBACK_STATE_ROOT);
+    const stateFile = path.join(dir, LEGACY_STATE_FILE_NAME);
+    if (fs.existsSync(stateFile) && isSecureExistingDir(LEGACY_FALLBACK_STATE_ROOT) && isSecureExistingDir(dir)) {
+      sources.push({ stateFile, stateDir: dir });
+    }
+  }
+
+  return sources;
+}
+
+function migrateLegacyJob(cwd, legacyStateDir, legacyJob) {
+  if (!legacyJob || typeof legacyJob !== "object" || Array.isArray(legacyJob)) {
+    return;
+  }
+
+  let jobId;
+  try {
+    jobId = assertJobId(legacyJob.id);
+  } catch {
+    return;
+  }
+
+  const legacyJobFile = path.join(legacyStateDir, JOBS_DIR_NAME, `${jobId}.json`);
+  const targetJobFile = path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  const legacyPayload = readJsonObject(legacyJobFile) ?? {};
+  const currentPayload = readJsonObject(targetJobFile) ?? {};
+  const record = {
+    ...legacyJob,
+    ...legacyPayload,
+    ...currentPayload,
+    id: jobId
+  };
+  if (!record.updatedAt) {
+    record.updatedAt = record.createdAt ?? nowIso();
+  }
+  if (!record.createdAt) {
+    record.createdAt = record.updatedAt;
+  }
+  writeFileAtomic(targetJobFile, `${JSON.stringify(record, null, 2)}\n`);
+}
+
+function migrateLegacyState(cwd) {
+  for (const source of legacyStateSources(cwd)) {
+    const legacyState = readJsonObject(source.stateFile);
+    if (!legacyState) {
+      continue;
+    }
+
+    ensureStateDir(cwd);
+    if (
+      !fs.existsSync(resolveConfigFile(cwd)) &&
+      legacyState.config &&
+      typeof legacyState.config === "object" &&
+      !Array.isArray(legacyState.config)
+    ) {
+      writeFileAtomic(
+        resolveConfigFile(cwd),
+        `${JSON.stringify({ ...defaultConfig(), ...legacyState.config }, null, 2)}\n`
+      );
+    }
+
+    if (Array.isArray(legacyState.jobs)) {
+      for (const job of legacyState.jobs) {
+        migrateLegacyJob(cwd, source.stateDir, job);
+      }
+    }
+
+    try {
+      fs.unlinkSync(source.stateFile);
+    } catch {
+      /* ignore: migration already materialized the replacement files */
+    }
+  }
+}
+
 // --- config (persistent user setting; migrates once from legacy state.json) --
 
 function readConfigRaw(cwd) {
+  migrateLegacyState(cwd);
   const configFile = resolveConfigFile(cwd);
   if (fs.existsSync(configFile)) {
     try {
@@ -209,18 +324,6 @@ function readConfigRaw(cwd) {
     }
   }
 
-  // One-time migration: the review-gate setting used to live in state.json.
-  const legacyFile = path.join(resolveStateDir(cwd), LEGACY_STATE_FILE_NAME);
-  if (fs.existsSync(legacyFile)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(legacyFile, "utf8"));
-      if (parsed && typeof parsed === "object" && parsed.config && typeof parsed.config === "object") {
-        return parsed.config;
-      }
-    } catch {
-      /* ignore malformed legacy state */
-    }
-  }
   return null;
 }
 
@@ -281,6 +384,7 @@ export function readJobFile(jobFile) {
 }
 
 export function listJobs(cwd) {
+  migrateLegacyState(cwd);
   const jobsDir = resolveJobsDir(cwd);
   let entries;
   try {

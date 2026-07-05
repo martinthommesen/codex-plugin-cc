@@ -96,6 +96,40 @@ test("listJobs scans per-job files newest-first and skips unparseable ones", () 
   );
 });
 
+test("listJobs migrates legacy state jobs and stored output into per-job files", () => {
+  const workspace = makeTempDir();
+  ensureStateDir(workspace);
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  const legacyJob = {
+    id: "review-legacy",
+    status: "completed",
+    summary: "legacy summary",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-02T00:00:00.000Z"
+  };
+  fs.writeFileSync(
+    path.join(jobsDir, "review-legacy.json"),
+    JSON.stringify({ result: { status: 0 }, rendered: "legacy output\n" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [legacyJob] }),
+    "utf8"
+  );
+
+  const jobs = listJobs(workspace);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].id, "review-legacy");
+  assert.equal(jobs[0].summary, "legacy summary");
+  assert.deepEqual(jobs[0].result, { status: 0 });
+  assert.equal(jobs[0].rendered, "legacy output\n");
+  assert.equal(getConfig(workspace).stopReviewGate, true);
+  assert.equal(fs.existsSync(path.join(stateDir, "state.json")), false);
+});
+
 test("the cancel marker is authoritative on read", () => {
   const workspace = makeTempDir();
   writeJobFile(workspace, "job-x", { status: "running" });
@@ -142,6 +176,28 @@ test("getConfig defaults when missing, warns-and-defaults when corrupt, migrates
     "legacy file removed after write"
   );
   assert.equal(getConfig(legacy).stopReviewGate, true);
+});
+
+test("getConfig migrates the old fallback state root into the uid-scoped root", (t) => {
+  const workspace = makeTempDir();
+  const newStateDir = resolveStateDir(workspace);
+  const oldStateDir = path.join(os.tmpdir(), "codex-companion", path.basename(newStateDir));
+  t.after(() => fs.rmSync(oldStateDir, { recursive: true, force: true }));
+  fs.mkdirSync(oldStateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(oldStateDir, "state.json"),
+    JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [{ id: "task-legacy", status: "running", updatedAt: "2026-01-01T00:00:00.000Z" }]
+    }),
+    "utf8"
+  );
+
+  assert.equal(getConfig(workspace).stopReviewGate, true);
+  assert.equal(listJobs(workspace)[0].id, "task-legacy");
+  assert.equal(resolveStateDir(workspace), newStateDir);
+  assert.equal(fs.existsSync(path.join(oldStateDir, "state.json")), false);
 });
 
 test("sweepJobs caps terminal jobs at 50 keeping the newest", () => {

@@ -28,7 +28,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { shorten } from "./lib/text.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, getProcessStartTime, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -758,7 +758,11 @@ function enqueueBackgroundTask(cwd, job, request) {
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  spawnDetachedTaskWorker(cwd, job.id);
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  updateJobFile(job.workspaceRoot, job.id, {
+    pid: child.pid ?? null,
+    pidStartTime: getProcessStartTime(child.pid ?? Number.NaN)
+  });
 
   return {
     payload: {
@@ -960,6 +964,10 @@ async function handleTaskWorker(argv) {
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status === "cancelled") {
+    appendLogLine(storedJob.logFile, "Cancelled before worker start.");
+    return;
   }
 
   const request = storedJob.request;

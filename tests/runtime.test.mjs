@@ -11,6 +11,7 @@ import { initGitRepo, makeTempDir, readStateFixture, run, seedStateFixture, writ
 import { createBrokerSocketHandler } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { getProcessStartTime } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1084,6 +1085,11 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   const launchPayload = JSON.parse(launched.stdout);
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
+  const queuedJob = await waitFor(() => {
+    const job = readStateFixture(resolveStateDir(repo)).jobs.find((candidate) => candidate.id === launchPayload.jobId);
+    return Number.isFinite(job?.pid) ? job : null;
+  });
+  assert.ok(queuedJob.pid > 0);
 
   const waitedStatus = run(
     "node",
@@ -2053,6 +2059,74 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
 });
+
+test(
+  "session end tears down the broker process group with stored pid identity",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const repo = makeTempDir();
+    const childPidFile = path.join(repo, "child.pid");
+    let childPid = null;
+    const parent = spawn(
+      process.execPath,
+      [
+        "-e",
+        [
+          'const { spawn } = require("node:child_process");',
+          'const fs = require("node:fs");',
+          'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+          "fs.writeFileSync(process.argv[1], String(child.pid));",
+          "setInterval(() => {}, 1000);"
+        ].join("\n"),
+        childPidFile
+      ],
+      { cwd: repo, detached: true, stdio: "ignore" }
+    );
+    parent.unref();
+
+    t.after(() => {
+      for (const pid of [-parent.pid, parent.pid, childPid]) {
+        try {
+          if (Number.isFinite(pid)) {
+            process.kill(pid, "SIGTERM");
+          }
+        } catch {
+          // Ignore missing cleanup processes.
+        }
+      }
+    });
+
+    childPid = await waitFor(() => {
+      if (!fs.existsSync(childPidFile)) {
+        return null;
+      }
+      return Number(fs.readFileSync(childPidFile, "utf8"));
+    });
+    const pidStartTime = await waitFor(() => getProcessStartTime(parent.pid));
+    saveBrokerSession(repo, {
+      pid: parent.pid,
+      pidStartTime
+    });
+
+    const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        cwd: repo
+      })
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    await waitFor(() => {
+      try {
+        process.kill(childPid, 0);
+        return false;
+      } catch (error) {
+        return error?.code === "ESRCH";
+      }
+    });
+  }
+);
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
