@@ -123,8 +123,9 @@ class AppServerClientBase {
     let message;
     try {
       message = JSON.parse(line);
-    } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+    } catch {
+      // Tolerate a stray non-JSON stdout line (incidental chatter) instead of
+      // tearing the whole connection down; only a real stream close ends it.
       return;
     }
 
@@ -342,7 +343,7 @@ export class CodexAppServerClient {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+        const brokerSession = await ensureBrokerSession(cwd, { env: options.env, killProcess: terminateProcessTree });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }

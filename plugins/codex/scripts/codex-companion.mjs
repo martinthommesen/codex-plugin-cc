@@ -1092,7 +1092,10 @@ async function handleCancel(argv) {
   // Marker first: it is authoritative on read, so even if the worker writes a
   // completion between here and the kill, the job still reads as cancelled.
   writeCancelMarker(workspaceRoot, job.id);
-  terminateProcessTree(job.pid ?? Number.NaN);
+  terminateProcessTree(job.pid ?? Number.NaN, {
+    expectedStartTime: job.pidStartTime ?? null,
+    requireIdentity: true
+  });
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

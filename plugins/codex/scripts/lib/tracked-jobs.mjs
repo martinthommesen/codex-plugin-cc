@@ -10,6 +10,7 @@ import {
   writeJobFile
 } from "./state.mjs";
 import { SESSION_ID_ENV } from "./constants.mjs";
+import { getProcessStartTime } from "./process.mjs";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -150,6 +151,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidStartTime: getProcessStartTime(process.pid),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
@@ -164,6 +166,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       turnId: execution.turnId ?? null,
       summary: execution.summary,
       pid: null,
+      pidStartTime: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt: nowIso(),
       result: execution.payload,
@@ -180,6 +183,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: "failed",
       errorMessage,
       pid: null,
+      pidStartTime: null,
       completedAt: nowIso(),
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
     });

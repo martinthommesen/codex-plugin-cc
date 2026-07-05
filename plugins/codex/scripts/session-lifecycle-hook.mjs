@@ -49,7 +49,10 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
     if (job.status === "queued" || job.status === "running") {
       try {
-        terminateProcessTree(job.pid ?? Number.NaN);
+        terminateProcessTree(job.pid ?? Number.NaN, {
+          expectedStartTime: job.pidStartTime ?? null,
+          requireIdentity: true
+        });
       } catch {
         // Ignore teardown failures during session shutdown.
       }

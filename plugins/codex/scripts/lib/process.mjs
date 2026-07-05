@@ -96,6 +96,41 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+// A durable-enough identity token for a pid: its OS start-time. Paired with the
+// pid it distinguishes "still our process" from "pid recycled to a stranger".
+// Returns null when the process is gone or the platform lookup is unavailable.
+export function getProcessStartTime(pid, options = {}) {
+  if (!Number.isFinite(pid)) {
+    return null;
+  }
+  const platform = options.platform ?? process.platform;
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  try {
+    if (platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      // Field 22 (starttime). comm (field 2) may contain spaces/parens, so index
+      // from after the final ')'; starttime is the 20th field that follows.
+      const afterComm = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+      return afterComm[19] ? `linux:${afterComm[19]}` : null;
+    }
+    if (platform === "win32") {
+      const result = runCommandImpl(
+        "powershell",
+        ["-NoProfile", "-Command", `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).StartTime.Ticks`],
+        {}
+      );
+      const out = String(result.stdout ?? "").trim();
+      return out ? `win:${out}` : null;
+    }
+    // macOS / BSD.
+    const result = runCommandImpl("ps", ["-o", "lstart=", "-p", String(pid)], {});
+    const out = String(result.stdout ?? "").trim();
+    return out ? `posix:${out}` : null;
+  } catch {
+    return null;
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
@@ -104,9 +139,28 @@ export function terminateProcessTree(pid, options = {}) {
   const platform = options.platform ?? process.platform;
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   const killImpl = options.killImpl ?? process.kill.bind(process);
+  const getStartTime = options.getStartTime ?? getProcessStartTime;
+
+  // Fail-closed identity check. A stored pid can be recycled to an unrelated
+  // process; when the caller supplies the expected start-time, verify it and only
+  // reap on a match. When a persisted pid carries no stored identity (a
+  // pre-upgrade record: requireIdentity without expectedStartTime), restrict the
+  // kill to the single pid rather than blindly signalling a whole group.
+  let killGroup = true;
+  if (options.expectedStartTime != null) {
+    const live = getStartTime(pid, { platform, runCommandImpl });
+    if (live == null) {
+      return { attempted: true, delivered: false, method: "identity", identity: "gone" };
+    }
+    if (live !== options.expectedStartTime) {
+      return { attempted: false, delivered: false, method: "identity", identity: "mismatch" };
+    }
+  } else if (options.requireIdentity) {
+    killGroup = false;
+  }
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    const result = runCommandImpl("taskkill", killGroup ? ["/PID", String(pid), "/T", "/F"] : ["/PID", String(pid), "/F"], {
       cwd: options.cwd,
       env: options.env
     });
@@ -137,6 +191,18 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     throw new Error(formatCommandFailure(result));
+  }
+
+  if (!killGroup) {
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
+      }
+      throw error;
+    }
   }
 
   try {

@@ -4,7 +4,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveExecutable, spawnConfigFor, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  getProcessStartTime,
+  resolveExecutable,
+  spawnConfigFor,
+  terminateProcessTree
+} from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -88,4 +93,61 @@ test("spawnConfigFor: a real Windows exe runs shell-free, a .cmd shim runs throu
 test("resolveExecutable leaves an explicit path untouched", () => {
   const explicit = "C:\\tools\\git.exe";
   assert.equal(resolveExecutable(explicit, { platform: "win32", env: { PATH: "", PATHEXT: ".EXE" } }), explicit);
+});
+
+test("getProcessStartTime returns a value for a live process", () => {
+  const startTime = getProcessStartTime(process.pid);
+  assert.equal(typeof startTime, "string");
+  assert.ok(startTime.length > 0);
+});
+
+test("terminateProcessTree group-kills when the process identity matches", () => {
+  const signals = [];
+  const outcome = terminateProcessTree(4242, {
+    platform: "linux",
+    expectedStartTime: "linux:111",
+    getStartTime: () => "linux:111",
+    killImpl: (pid) => signals.push(pid)
+  });
+  assert.deepEqual(signals, [-4242]); // whole process group
+  assert.equal(outcome.method, "process-group");
+});
+
+test("terminateProcessTree skips the kill when the identity does not match (recycled pid)", () => {
+  let killed = false;
+  const outcome = terminateProcessTree(4242, {
+    platform: "linux",
+    expectedStartTime: "linux:111",
+    getStartTime: () => "linux:999",
+    killImpl: () => {
+      killed = true;
+    }
+  });
+  assert.equal(killed, false);
+  assert.equal(outcome.identity, "mismatch");
+  assert.equal(outcome.delivered, false);
+});
+
+test("terminateProcessTree treats a vanished process as nothing to kill", () => {
+  let killed = false;
+  const outcome = terminateProcessTree(4242, {
+    platform: "linux",
+    expectedStartTime: "linux:111",
+    getStartTime: () => null,
+    killImpl: () => {
+      killed = true;
+    }
+  });
+  assert.equal(killed, false);
+  assert.equal(outcome.identity, "gone");
+});
+
+test("terminateProcessTree without a stored identity restricts to the single pid", () => {
+  const signals = [];
+  terminateProcessTree(4242, {
+    platform: "linux",
+    requireIdentity: true,
+    killImpl: (pid) => signals.push(pid)
+  });
+  assert.deepEqual(signals, [4242]); // single pid, never the group
 });

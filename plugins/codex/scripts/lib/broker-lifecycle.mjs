@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureStateDir, resolveStateDir, writeFileAtomic } from "./state.mjs";
+import { getProcessStartTime } from "./process.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
@@ -122,6 +123,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       logFile: existing.logFile ?? null,
       sessionDir: existing.sessionDir ?? null,
       pid: existing.pid ?? null,
+      pidStartTime: existing.pidStartTime ?? null,
       killProcess: options.killProcess ?? null
     });
     clearBrokerSession(cwd);
@@ -144,6 +146,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     logFile,
     env: options.env ?? process.env
   });
+  const pid = child.pid ?? null;
+  const pidStartTime = getProcessStartTime(pid ?? Number.NaN);
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
@@ -152,7 +156,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pidFile,
       logFile,
       sessionDir,
-      pid: child.pid ?? null,
+      pid,
+      pidStartTime,
       killProcess: options.killProcess ?? null
     });
     return null;
@@ -163,16 +168,25 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid,
+    pidStartTime
   };
   saveBrokerSession(cwd, session);
   return session;
 }
 
-export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
+export function teardownBrokerSession({
+  endpoint = null,
+  pidFile,
+  logFile,
+  sessionDir = null,
+  pid = null,
+  pidStartTime = null,
+  killProcess = null
+}) {
   if (Number.isFinite(pid) && killProcess) {
     try {
-      killProcess(pid);
+      killProcess(pid, { expectedStartTime: pidStartTime, requireIdentity: true });
     } catch {
       // Ignore missing or already-exited broker processes.
     }
