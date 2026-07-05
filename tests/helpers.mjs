@@ -4,6 +4,17 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Hermetic tests: drop ambient plugin session vars (CODEX_COMPANION_*,
+// CLAUDE_PLUGIN_DATA) so the suite behaves identically inside a Claude Code
+// session (where the plugin exports them) and in clean CI. Stripping here — not
+// only in buildEnv — also keeps the test process's own resolveStateDir() in
+// sync with the CLI subprocesses it spawns (both then use the /tmp fallback).
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("CODEX_COMPANION_") || key === "CLAUDE_PLUGIN_DATA") {
+    delete process.env[key];
+  }
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
