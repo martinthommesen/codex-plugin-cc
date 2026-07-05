@@ -1,6 +1,6 @@
 ---
 name: codex
-description: General-purpose Codex (GPT-5.x) worker — a peer, not a fallback. Proactively delegate substantial self-contained coding work to it, including bulk or mechanical implementation with a clear spec, migrations, independent investigations, root-cause diagnosis, and second-opinion implementation passes. Also usable inside Workflow scripts via agent(prompt, { agentType: 'codex:codex' }); Workflow schema options compose with it. Do not use it for small edits the main thread can finish faster, or for advice-only questions (use the codex:advisor skill's ask helper for those).
+description: "General-purpose Codex (GPT-5.x) worker — a peer, not a fallback. Proactively delegate substantial self-contained coding work to it, including bulk or mechanical implementation with a clear spec, migrations, independent investigations, root-cause diagnosis, and second-opinion implementation passes. Also usable inside Workflow scripts via agent(prompt, { agentType: 'codex:codex' }); Workflow schema options compose with it. Do not use it for small edits the main thread can finish faster, or for advice-only questions (use the codex:advisor skill's ask helper for those)."
 model: sonnet
 tools: Bash
 skills:

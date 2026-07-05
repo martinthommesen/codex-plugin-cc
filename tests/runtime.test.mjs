@@ -2386,6 +2386,11 @@ test("ask supports --json, --prompt-file, and --cwd", () => {
   assert.equal(fromFile.status, 0, fromFile.stderr);
   assert.equal(readFakeState(binDir).lastTurnStart.prompt, "file question");
 
+  fs.writeFileSync(promptFile, " \n\t", "utf8");
+  const blankFile = run("node", [SCRIPT, "ask", "--prompt-file", "question.txt"], { cwd: repo, env });
+  assert.equal(blankFile.status, 1);
+  assert.match(blankFile.stderr, /Provide a question/);
+
   const viaCwd = run("node", [SCRIPT, "ask", "--cwd", repo, "cwd question"], { cwd: otherCwd, env });
   assert.equal(viaCwd.status, 0, viaCwd.stderr);
   const stateDir = resolveStateDir(repo);
@@ -2841,6 +2846,52 @@ test("stop hook labels a running review job as review", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stderr, /Codex review review-live is still running/i);
+});
+
+test("stop hook falls back to legacy job kind when jobClass is absent", () => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const runningLog = path.join(jobsDir, "review-live.log");
+  fs.writeFileSync(runningLog, "running\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "legacy-review-live",
+            kind: "review",
+            kindLabel: "task",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            logFile: runningLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({ cwd: repo })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Codex review legacy-review-live is still running/i);
 });
 
 test("result without a job id reports a first-ever running ask as still running", () => {

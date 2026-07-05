@@ -721,12 +721,14 @@ async function executeTransfer(cwd, options = {}) {
 }
 
 function readTaskPrompt(cwd, options, positionals) {
+  let prompt;
   if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+    prompt = fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+  } else {
+    const positionalPrompt = positionals.join(" ");
+    prompt = positionalPrompt || readStdinIfPiped();
   }
-
-  const positionalPrompt = positionals.join(" ");
-  return positionalPrompt || readStdinIfPiped();
+  return prompt.trimEnd();
 }
 
 function requireTaskRequest(prompt, resumeLast) {
