@@ -35,7 +35,9 @@ import {
   getConfig,
   listJobs,
   setConfig,
-  upsertJob,
+  sweepJobs,
+  updateJobFile,
+  writeCancelMarker,
   writeJobFile
 } from "./lib/state.mjs";
 import {
@@ -735,17 +737,20 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // Reap stale jobs, then persist the queued record BEFORE spawning so the
+  // detached worker can never read-before-exists. The worker stamps its own pid
+  // (and, in Group B, its start-time) as its first action via runTrackedJob.
+  sweepJobs(job.workspaceRoot);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  spawnDetachedTaskWorker(cwd, job.id);
 
   return {
     payload: {
@@ -1082,6 +1087,9 @@ async function handleCancel(argv) {
     );
   }
 
+  // Marker first: it is authoritative on read, so even if the worker writes a
+  // completion between here and the kill, the job still reads as cancelled.
+  writeCancelMarker(workspaceRoot, job.id);
   terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
 
@@ -1095,18 +1103,14 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
+  // Keep the record consistent too (the marker remains the ultimate authority).
+  updateJobFile(workspaceRoot, job.id, {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
+    completedAt,
+    cancelledAt: completedAt,
+    errorMessage: "Cancelled by user."
   });
 
   const payload = {

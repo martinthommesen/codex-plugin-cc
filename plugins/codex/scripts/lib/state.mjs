@@ -2,28 +2,73 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { PLUGIN_DATA_ENV } from "./constants.mjs";
 
-const STATE_VERSION = 1;
-const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
-const STATE_FILE_NAME = "state.json";
+const CONFIG_FILE_NAME = "config.json";
+const LEGACY_STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
-const MAX_JOBS = 50;
+const CANCEL_MARKER_SUFFIX = ".cancelled";
+const MAX_TERMINAL_JOBS = 50;
+// A queued job that never records a worker pid within this window is treated as
+// a crashed launch and reaped by sweepJobs.
+const STALE_QUEUED_MS = 2 * 60 * 1000;
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function defaultState() {
-  return {
-    version: STATE_VERSION,
-    config: {
-      stopReviewGate: false
-    },
-    jobs: []
-  };
+function defaultConfig() {
+  return { stopReviewGate: false };
+}
+
+/**
+ * Reject anything that could escape the jobs directory when interpolated into a
+ * path. Job ids are generated as `[a-z0-9-]` so this only ever fires on tampered
+ * or hostile input (e.g. a crafted `--job-id`).
+ * @param {unknown} jobId
+ * @returns {string}
+ */
+export function assertJobId(jobId) {
+  if (
+    typeof jobId !== "string" ||
+    jobId.length === 0 ||
+    jobId === "." ||
+    jobId.includes("/") ||
+    jobId.includes("\\") ||
+    jobId.includes("..") ||
+    jobId.includes("\0") ||
+    path.basename(jobId) !== jobId
+  ) {
+    throw new Error(`Invalid job id: ${JSON.stringify(jobId)}`);
+  }
+  return jobId;
+}
+
+// --- user scoping + secure directory creation -----------------------------
+
+const USER_SCOPE = (() => {
+  try {
+    const info = os.userInfo();
+    if (typeof info.uid === "number" && info.uid >= 0) {
+      return { uid: info.uid, tag: String(info.uid) };
+    }
+    const name = String(info.username || "user").replace(/[^a-zA-Z0-9._-]+/g, "-") || "user";
+    return { uid: null, tag: name };
+  } catch {
+    return { uid: null, tag: "user" };
+  }
+})();
+
+function resolveStateRoot() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  if (pluginDataDir) {
+    return path.join(pluginDataDir, "state");
+  }
+  // uid-scoped so a predictable /tmp path cannot be pre-planted by another user.
+  return path.join(os.tmpdir(), `codex-companion-${USER_SCOPE.tag}`);
 }
 
 export function resolveStateDir(cwd) {
@@ -38,154 +83,344 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
-}
-
-export function resolveStateFile(cwd) {
-  return path.join(resolveStateDir(cwd), STATE_FILE_NAME);
+  return path.join(resolveStateRoot(), `${slug}-${hash}`);
 }
 
 export function resolveJobsDir(cwd) {
   return path.join(resolveStateDir(cwd), JOBS_DIR_NAME);
 }
 
-export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+export function resolveConfigFile(cwd) {
+  return path.join(resolveStateDir(cwd), CONFIG_FILE_NAME);
 }
 
-export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
-  }
-
+function lstatSafe(target) {
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
+    return fs.lstatSync(target);
   } catch {
-    return defaultState();
+    return null;
   }
 }
 
-function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
-}
-
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
-}
-
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
-  const nextState = {
-    version: STATE_VERSION,
-    config: {
-      ...defaultState().config,
-      ...(state.config ?? {})
-    },
-    jobs: nextJobs
-  };
-
-  const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
+// Create/verify a single directory level we own. On POSIX, refuse to descend
+// into a symlink or a directory owned by another user (symlink pre-plant
+// defense). Windows relies on the per-user profile temp + default ACLs.
+function ensureSecureDir(dir) {
+  const info = lstatSafe(dir);
+  if (info) {
+    if (info.isSymbolicLink()) {
+      throw new Error(`Refusing to use a symlinked state directory: ${dir}`);
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
+    if (!info.isDirectory()) {
+      throw new Error(`State path exists and is not a directory: ${dir}`);
+    }
+    if (process.platform !== "win32" && USER_SCOPE.uid != null && info.uid !== USER_SCOPE.uid) {
+      throw new Error(`Refusing to use a state directory owned by another user: ${dir}`);
+    }
+    return;
+  }
+  fs.mkdirSync(dir, { mode: 0o700 });
+}
+
+const ensuredDirs = new Set();
+
+export function ensureStateDir(cwd) {
+  const jobsDir = resolveJobsDir(cwd);
+  if (ensuredDirs.has(jobsDir)) {
+    return;
+  }
+  const root = resolveStateRoot();
+  // The root's parent is a system/user dir we do not own; create it plainly.
+  fs.mkdirSync(path.dirname(root), { recursive: true });
+  ensureSecureDir(root);
+  ensureSecureDir(resolveStateDir(cwd));
+  ensureSecureDir(jobsDir);
+  ensuredDirs.add(jobsDir);
+}
+
+// --- atomic write ----------------------------------------------------------
+
+/**
+ * Write `data` to `file` atomically and privately: a same-directory temp file
+ * created at `mode`, then renamed over the target. Never leaves a torn/partial
+ * or world-readable file. Retries the rename on Windows EPERM/EBUSY (a reader
+ * holding the target open can transiently block the replace).
+ * @param {string} file
+ * @param {string} data
+ * @param {number} [mode]
+ */
+export function writeFileAtomic(file, data, mode = 0o600) {
+  const dir = path.dirname(file);
+  let tmp;
+  for (;;) {
+    tmp = path.join(dir, `.${path.basename(file)}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`);
+    let fd;
+    try {
+      fd = fs.openSync(tmp, "wx", mode); // exclusive create at mode (umask can only lower it)
+    } catch (error) {
+      if (error && error.code === "EEXIST") {
+        continue; // vanishingly rare name collision; pick another
+      }
+      throw error;
+    }
+    try {
+      fs.writeSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    break;
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
-  return nextState;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (error) {
+      const transient = error && (error.code === "EPERM" || error.code === "EBUSY" || error.code === "EACCES");
+      if (transient && attempt < 20) {
+        continue;
+      }
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* ignore cleanup failure */
+      }
+      throw error;
+    }
+  }
 }
 
-export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+// --- config (persistent user setting; migrates once from legacy state.json) --
+
+function readConfigRaw(cwd) {
+  const configFile = resolveConfigFile(cwd);
+  if (fs.existsSync(configFile)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(configFile, "utf8"));
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      // A corrupt config is NOT silently reset without a trace. The gate is an
+      // opt-in workflow convenience (default off), not a security boundary, so
+      // defaulting off here is safe — but we surface it.
+      process.stderr.write(`[codex] Warning: ${configFile} is unreadable; using default config.\n`);
+      return null;
+    }
+  }
+
+  // One-time migration: the review-gate setting used to live in state.json.
+  const legacyFile = path.join(resolveStateDir(cwd), LEGACY_STATE_FILE_NAME);
+  if (fs.existsSync(legacyFile)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(legacyFile, "utf8"));
+      if (parsed && typeof parsed === "object" && parsed.config && typeof parsed.config === "object") {
+        return parsed.config;
+      }
+    } catch {
+      /* ignore malformed legacy state */
+    }
+  }
+  return null;
 }
+
+export function getConfig(cwd) {
+  return { ...defaultConfig(), ...(readConfigRaw(cwd) ?? {}) };
+}
+
+export function setConfig(cwd, key, value) {
+  ensureStateDir(cwd);
+  const next = { ...getConfig(cwd), [key]: value };
+  writeFileAtomic(resolveConfigFile(cwd), `${JSON.stringify(next, null, 2)}\n`);
+  // The legacy index is fully superseded once config is persisted separately.
+  const legacyFile = path.join(resolveStateDir(cwd), LEGACY_STATE_FILE_NAME);
+  try {
+    fs.unlinkSync(legacyFile);
+  } catch {
+    /* ignore: no legacy file */
+  }
+  return next;
+}
+
+// --- jobs (per-file store; the index is derived by scanning) ---------------
 
 export function generateJobId(prefix = "job") {
   const random = Math.random().toString(36).slice(2, 8);
   return `${prefix}-${Date.now().toString(36)}-${random}`;
 }
 
-export function upsertJob(cwd, jobPatch) {
-  return updateState(cwd, (state) => {
-    const timestamp = nowIso();
-    const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
-    if (existingIndex === -1) {
-      state.jobs.unshift({
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        ...jobPatch
-      });
-      return;
-    }
-    state.jobs[existingIndex] = {
-      ...state.jobs[existingIndex],
-      ...jobPatch,
-      updatedAt: timestamp
-    };
-  });
-}
-
-export function listJobs(cwd) {
-  return loadState(cwd).jobs;
-}
-
-export function setConfig(cwd, key, value) {
-  return updateState(cwd, (state) => {
-    state.config = {
-      ...state.config,
-      [key]: value
-    };
-  });
-}
-
-export function getConfig(cwd) {
-  return loadState(cwd).config;
-}
-
-export function writeJobFile(cwd, jobId, payload) {
+export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
-  const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  return jobFile;
-}
-
-export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
-}
-
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
-  }
+  return path.join(resolveJobsDir(cwd), `${assertJobId(jobId)}.json`);
 }
 
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.log`);
+  return path.join(resolveJobsDir(cwd), `${assertJobId(jobId)}.log`);
 }
 
-export function resolveJobFile(cwd, jobId) {
+function resolveCancelMarker(cwd, jobId) {
+  return path.join(resolveJobsDir(cwd), `${assertJobId(jobId)}${CANCEL_MARKER_SUFFIX}`);
+}
+
+/**
+ * Read one per-job record. The durable `<id>.cancelled` marker is authoritative:
+ * if present it overlays `status:"cancelled"`, so a worker's in-flight
+ * completion write can never un-cancel a job (no lock, no TOCTOU).
+ * @param {string} jobFile
+ */
+export function readJobFile(jobFile) {
+  const parsed = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  if (parsed && typeof parsed === "object" && jobFile.endsWith(".json")) {
+    const marker = `${jobFile.slice(0, -".json".length)}${CANCEL_MARKER_SUFFIX}`;
+    if (fs.existsSync(marker)) {
+      return { ...parsed, status: "cancelled" };
+    }
+  }
+  return parsed;
+}
+
+export function listJobs(cwd) {
+  const jobsDir = resolveJobsDir(cwd);
+  let entries;
+  try {
+    entries = fs.readdirSync(jobsDir);
+  } catch {
+    return [];
+  }
+
+  const jobs = [];
+  for (const name of entries) {
+    if (!name.endsWith(".json")) {
+      continue;
+    }
+    const jobId = name.slice(0, -".json".length);
+    try {
+      assertJobId(jobId);
+    } catch {
+      continue; // ignore tampered/foreign filenames
+    }
+    try {
+      const job = readJobFile(path.join(jobsDir, name));
+      if (job && typeof job === "object" && job.id) {
+        jobs.push(job);
+      }
+    } catch {
+      // skip an individual unparseable/torn file rather than losing all history
+    }
+  }
+  jobs.sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  return jobs;
+}
+
+/** Full atomic write of a job record; always stamps `updatedAt`. */
+export function writeJobFile(cwd, jobId, payload) {
+  const now = nowIso();
+  const record = { createdAt: now, ...payload, id: assertJobId(jobId), updatedAt: now };
+  writeFileAtomic(resolveJobFile(cwd, jobId), `${JSON.stringify(record, null, 2)}\n`);
+  return record;
+}
+
+/** Merge `patch` onto an existing record. No-op if the record is absent (never creates a partial). */
+export function updateJobFile(cwd, jobId, patch) {
+  assertJobId(jobId);
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
+  }
+  let current;
+  try {
+    current = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  } catch {
+    return null;
+  }
+  const record = { ...current, ...patch, id: jobId, updatedAt: nowIso() };
+  writeFileAtomic(jobFile, `${JSON.stringify(record, null, 2)}\n`);
+  return record;
+}
+
+/** Write the durable cancel marker (before killing the process). */
+export function writeCancelMarker(cwd, jobId) {
   ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  writeFileAtomic(resolveCancelMarker(cwd, jobId), `${nowIso()}\n`);
+}
+
+function removeFileIfExists(filePath) {
+  if (!filePath) {
+    return;
+  }
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    /* ignore ENOENT / races */
+  }
+}
+
+export function removeJob(cwd, jobId) {
+  assertJobId(jobId);
+  const jobsDir = resolveJobsDir(cwd);
+  const jobFile = path.join(jobsDir, `${jobId}.json`);
+  // Also remove a stored logFile even if it isn't the canonical <id>.log path.
+  try {
+    removeFileIfExists(JSON.parse(fs.readFileSync(jobFile, "utf8")).logFile);
+  } catch {
+    /* no record or unreadable */
+  }
+  removeFileIfExists(jobFile);
+  removeFileIfExists(path.join(jobsDir, `${jobId}.log`));
+  removeFileIfExists(path.join(jobsDir, `${jobId}${CANCEL_MARKER_SUFFIX}`));
+}
+
+function isPidAlive(pid) {
+  if (!Number.isFinite(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // ESRCH = gone; EPERM = exists but owned by someone we can't signal.
+    return Boolean(error) && error.code === "EPERM";
+  }
+}
+
+function isStaleQueuedWithoutPid(job) {
+  if (job.pid != null) {
+    return false;
+  }
+  const created = Date.parse(job.createdAt ?? job.updatedAt ?? "");
+  return Number.isFinite(created) && Date.now() - created > STALE_QUEUED_MS;
+}
+
+/**
+ * Bound the jobs directory: keep all live-active jobs plus the latest
+ * MAX_TERMINAL_JOBS terminal ones. Reaps active records whose process is gone
+ * (crash) so they stop masquerading as running. Called at job-creation cadence.
+ *
+ * `isJobAlive` is injectable — Group A checks pid liveness only; the process
+ * identity check (pid + start-time) is layered in by callers in Group B.
+ */
+export function sweepJobs(cwd, options = {}) {
+  const isJobAlive = options.isJobAlive ?? ((job) => job.pid != null && isPidAlive(job.pid));
+
+  for (const job of listJobs(cwd)) {
+    const active = job.status === "queued" || job.status === "running";
+    if (!active) {
+      continue;
+    }
+    const dead = job.pid != null ? !isJobAlive(job) : isStaleQueuedWithoutPid(job);
+    if (dead) {
+      updateJobFile(cwd, job.id, {
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        pidStartTime: null,
+        errorMessage: job.errorMessage ?? "Codex process exited without finalizing the job."
+      });
+    }
+  }
+
+  const terminal = listJobs(cwd).filter((job) => job.status !== "queued" && job.status !== "running");
+  for (const job of terminal.slice(MAX_TERMINAL_JOBS)) {
+    removeJob(cwd, job.id);
+  }
 }

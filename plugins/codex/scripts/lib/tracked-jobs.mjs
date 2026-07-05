@@ -1,7 +1,14 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  readJobFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  sweepJobs,
+  updateJobFile,
+  writeJobFile
+} from "./state.mjs";
 import { SESSION_ID_ENV } from "./constants.mjs";
 
 export function nowIso() {
@@ -37,19 +44,22 @@ export function appendLogLine(logFile, message) {
   if (!logFile || !normalized) {
     return;
   }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
+  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 export function appendLogBlock(logFile, title, body) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, {
+    encoding: "utf8",
+    mode: 0o600
+  });
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
   const logFile = resolveJobLogFile(workspaceRoot, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(logFile, "", { encoding: "utf8", mode: 0o600 });
   if (title) {
     appendLogLine(logFile, `Starting ${title}.`);
   }
@@ -98,18 +108,8 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+    // Single atomic merge; no-op if the record was pruned/cancelled away.
+    updateJobFile(workspaceRoot, jobId, patch);
   };
 }
 
@@ -139,6 +139,11 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  // Reap crashed/stale jobs and cap history at job-creation cadence.
+  sweepJobs(job.workspaceRoot);
+
+  // This process owns the record: it stamps its own pid as its first action, so
+  // there is no parent/worker patch race and no pid-less active window.
   const runningRecord = {
     ...job,
     status: "running",
@@ -148,55 +153,35 @@ export async function runTrackedJob(job, runner, options = {}) {
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
 
   try {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
+      summary: execution.summary,
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
+      completedAt: nowIso(),
       result: execution.payload,
       rendered: execution.rendered
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
       phase: "failed",
       errorMessage,
       pid: null,
-      completedAt,
+      completedAt: nowIso(),
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
     });
     throw error;
   }

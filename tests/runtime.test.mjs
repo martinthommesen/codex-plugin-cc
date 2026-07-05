@@ -6,7 +6,14 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import {
+  initGitRepo,
+  makeTempDir,
+  readStateFixture,
+  run,
+  seedStateFixture,
+  writeJobFixture
+} from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -471,7 +478,7 @@ test("review logs reasoning summaries and review output to the job log", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Reviewed the changed files and checked the likely regression paths/);
@@ -509,10 +516,7 @@ test("task-resume-candidate returns the latest task thread from the current sess
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -547,12 +551,7 @@ test("task-resume-candidate returns the latest task thread from the current sess
             updatedAt: "2026-03-24T20:10:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
     cwd: workspace,
@@ -625,10 +624,7 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
 
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -643,12 +639,7 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
             updatedAt: "2026-03-24T20:05:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const env = {
     ...buildEnv(binDir),
@@ -800,7 +791,7 @@ test("task logs reasoning summaries and assistant messages to the job log", () =
 
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Inspected the prompt, gathered evidence, and checked the highest-risk paths first/);
@@ -824,7 +815,7 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Starting subagent design-challenger via collaboration tool: wait\./);
   assert.match(log, /Subagent design-challenger reasoning:/);
@@ -1096,10 +1087,7 @@ test("status shows phases, hints, and the latest finished job", () => {
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1130,12 +1118,7 @@ test("status shows phases, hints, and the latest finished job", () => {
             updatedAt: "2026-03-18T15:11:10.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
@@ -1171,10 +1154,7 @@ test("status without a job id only shows jobs from the current Claude session", 
   fs.writeFileSync(currentLog, "[2026-03-18T15:30:00.000Z] Reviewer started: current changes\n", "utf8");
   fs.writeFileSync(otherLog, "[2026-03-18T15:31:00.000Z] Reviewer started: old changes\n", "utf8");
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1209,12 +1189,7 @@ test("status without a job id only shows jobs from the current Claude session", 
             updatedAt: "2026-03-18T15:21:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace,
@@ -1240,10 +1215,7 @@ test("status preserves adversarial review kind labels", () => {
   const logFile = path.join(jobsDir, "review-adv.log");
   fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Reviewer started: adversarial review\n", "utf8");
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1274,12 +1246,7 @@ test("status preserves adversarial review kind labels", () => {
             updatedAt: "2026-03-18T15:11:10.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
@@ -1315,10 +1282,7 @@ test("status --wait times out cleanly when a job is still active", () => {
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1334,12 +1298,7 @@ test("status --wait times out cleanly when a job is still active", () => {
             updatedAt: "2026-03-18T15:30:02.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
     cwd: workspace
@@ -1379,10 +1338,7 @@ test("result returns the stored output for the latest finished job by default", 
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1397,12 +1353,7 @@ test("result returns the stored output for the latest finished job by default", 
             updatedAt: "2026-03-18T15:01:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace
@@ -1461,10 +1412,7 @@ test("result without a job id prefers the latest finished job from the current C
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1491,12 +1439,7 @@ test("result without a job id prefers the latest finished job from the current C
             updatedAt: "2026-03-18T15:21:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace,
@@ -1581,10 +1524,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     ),
     "utf8"
   );
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1601,12 +1541,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             updatedAt: "2026-03-18T15:30:02.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
     cwd: workspace
@@ -1624,7 +1559,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const cancelled = state.jobs.find((job) => job.id === "task-live");
   assert.equal(cancelled.status, "cancelled");
   assert.equal(cancelled.pid, null);
@@ -1642,10 +1577,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
 
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1660,12 +1592,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
             logFile
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const env = {
     ...process.env,
@@ -1685,7 +1612,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(cancel.status, 1);
   assert.match(cancel.stderr, /No active Codex jobs to cancel for this session\./);
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   assert.equal(state.jobs[0].status, "running");
 });
 
@@ -1697,10 +1624,7 @@ test("cancel with a job id can still target an active job from another Claude se
 
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1715,12 +1639,7 @@ test("cancel with a job id can still target an active job from another Claude se
             logFile
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const env = {
     ...process.env,
@@ -1733,7 +1652,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(cancel.status, 0, cancel.stderr);
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
@@ -1760,7 +1679,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
 
   const stateDir = resolveStateDir(repo);
   const runningJob = await waitFor(() => {
-    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const state = readStateFixture(stateDir);
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (job?.status === "running" && job.threadId && job.turnId) {
       return job;
@@ -1844,10 +1763,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -1880,12 +1796,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
             updatedAt: "2026-03-18T15:35:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -1917,7 +1828,7 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
@@ -1993,10 +1904,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   const runningLog = path.join(jobsDir, "task-running.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: {
           stopReviewGate: false
@@ -2013,12 +1921,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
             updatedAt: "2026-03-18T15:33:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const blocked = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2394,7 +2297,7 @@ test("ask supports --json, --prompt-file, and --cwd", () => {
   const viaCwd = run("node", [SCRIPT, "ask", "--cwd", repo, "cwd question"], { cwd: otherCwd, env });
   assert.equal(viaCwd.status, 0, viaCwd.stderr);
   const stateDir = resolveStateDir(repo);
-  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const jobs = readStateFixture(stateDir).jobs;
   assert.equal(jobs[0].kind, "ask");
 });
 
@@ -2413,7 +2316,7 @@ test("ask preflight failure leaves a failed tracked job that result renders gene
   assert.match(result.stderr, /Codex CLI is not installed/);
 
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const askJob = state.jobs.find((job) => job.jobClass === "ask");
   assert.equal(askJob.status, "failed");
 
@@ -2446,7 +2349,7 @@ test("ask stays out of task resume and default result selection", () => {
   assert.doesNotMatch(result.stdout, /Codex advisor thread:/);
 
   const stateDir = resolveStateDir(repo);
-  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const jobs = readStateFixture(stateDir).jobs;
   const askJob = jobs.find((job) => job.jobClass === "ask");
   const askResult = run("node", [SCRIPT, "result", askJob.id], { cwd: repo, env });
   assert.equal(askResult.status, 0, askResult.stderr);
@@ -2482,9 +2385,7 @@ test("status labels completed and running ask jobs as ask", () => {
   assert.equal(finishedReport.latestFinished.kindLabel, "ask");
 
   const stateDir = resolveStateDir(repo);
-  const statePath = path.join(stateDir, "state.json");
-  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  state.jobs.unshift({
+  writeJobFixture(stateDir, {
     id: "ask-live",
     status: "running",
     title: "Codex Advisor",
@@ -2493,7 +2394,6 @@ test("status labels completed and running ask jobs as ask", () => {
     summary: "Live advisor question",
     updatedAt: "2099-01-01T00:00:00.000Z"
   });
-  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 
   const running = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
   assert.equal(running.status, 0, running.stderr);
@@ -2526,10 +2426,7 @@ test("stop hook labels a running ask job as ask", () => {
   fs.mkdirSync(jobsDir, { recursive: true });
   const runningLog = path.join(jobsDir, "ask-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -2544,12 +2441,7 @@ test("stop hook labels a running ask job as ask", () => {
             updatedAt: "2026-03-18T15:33:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2571,34 +2463,22 @@ test("ask self-heals around interrupted ask jobs", () => {
   installFakeCodex(binDir);
   const env = askEnv(binDir, "sess-current");
   const stateDir = resolveStateDir(repo);
-  const statePath = path.join(stateDir, "state.json");
 
   // An ask killed before its thread was created leaves a running record without a
   // threadId — nothing to resume, so the next ask starts fresh.
-  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    statePath,
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "ask-stuck-no-thread",
-            status: "running",
-            title: "Codex Advisor",
-            jobClass: "ask",
-            sessionId: "sess-current",
-            summary: "Interrupted before thread creation",
-            updatedAt: "2099-01-01T00:00:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "ask-stuck-no-thread",
+        status: "running",
+        title: "Codex Advisor",
+        jobClass: "ask",
+        sessionId: "sess-current",
+        summary: "Interrupted before thread creation",
+        updatedAt: "2099-01-01T00:00:00.000Z"
+      }
+    ]
+  });
 
   const fresh = run("node", [SCRIPT, "ask", "no resumable thread yet"], { cwd: repo, env });
   assert.equal(fresh.status, 0, fresh.stderr);
@@ -2606,14 +2486,14 @@ test("ask self-heals around interrupted ask jobs", () => {
 
   // An ask killed AFTER thread creation leaves a running record with a threadId.
   // The next ask must resume that thread so the conversation context survives.
-  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const state = readStateFixture(stateDir);
   for (const job of state.jobs) {
     if (job.threadId === "thr_1") {
       job.status = "running";
       job.updatedAt = "2099-01-02T00:00:00.000Z";
+      writeJobFixture(stateDir, job);
     }
   }
-  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 
   const resumed = run("node", [SCRIPT, "ask", "continue after the interruption"], { cwd: repo, env });
   assert.equal(resumed.status, 0, resumed.stderr);
@@ -2765,7 +2645,7 @@ test("a failed ask turn renders loudly, keeps its thread, and stays resumable", 
   assert.match(failed.stdout, /Codex advisor thread: thr_1 \(new\)/);
 
   const stateDir = resolveStateDir(repo);
-  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const jobs = readStateFixture(stateDir).jobs;
   const askJob = jobs.find((job) => job.jobClass === "ask");
   assert.equal(askJob.status, "failed");
   assert.equal(askJob.threadId, "thr_1");
@@ -2810,10 +2690,7 @@ test("stop hook labels a running review job as review", () => {
   fs.mkdirSync(jobsDir, { recursive: true });
   const runningLog = path.join(jobsDir, "review-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -2828,12 +2705,7 @@ test("stop hook labels a running review job as review", () => {
             updatedAt: "2026-03-18T15:33:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2855,10 +2727,7 @@ test("stop hook falls back to legacy job kind when jobClass is absent", () => {
   fs.mkdirSync(jobsDir, { recursive: true });
   const runningLog = path.join(jobsDir, "review-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -2874,12 +2743,7 @@ test("stop hook falls back to legacy job kind when jobClass is absent", () => {
             updatedAt: "2026-03-18T15:33:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2898,10 +2762,7 @@ test("result without a job id reports a first-ever running ask as still running"
   const repo = makeTempDir();
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
+  seedStateFixture(stateDir, {
         version: 1,
         config: { stopReviewGate: false },
         jobs: [
@@ -2915,12 +2776,7 @@ test("result without a job id reports a first-ever running ask as still running"
             updatedAt: "2099-01-01T00:00:00.000Z"
           }
         ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: repo,
