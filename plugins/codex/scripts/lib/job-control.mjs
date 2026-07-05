@@ -270,7 +270,9 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(
+    reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot))
+  );
   const isFinished = (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled";
   // Bare `result` shows the latest task/review outcome. Advisor asks were answered inline, and
   // stop-gate reviews are internal — both stay reachable by explicit job id only.

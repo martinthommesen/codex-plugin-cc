@@ -101,7 +101,7 @@ function runStopReview(cwd, input = {}) {
     maxBuffer: 64 * 1024 * 1024
   });
 
-  if (result.error?.code === "ETIMEDOUT") {
+  if (/** @type {NodeJS.ErrnoException | undefined} */ (result.error)?.code === "ETIMEDOUT") {
     return {
       ok: false,
       reason:

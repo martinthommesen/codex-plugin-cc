@@ -29,10 +29,10 @@ const TARGETS = [
         }
       },
       {
-        label: "packages[\"\"].version",
+        label: 'packages[""].version',
         get: (json) => json.packages?.[""]?.version,
         set: (json, version) => {
-          requireObject(json.packages?.[""], "package-lock.json packages[\"\"]");
+          requireObject(json.packages?.[""], 'package-lock.json packages[""]');
           json.packages[""].version = version;
         }
       }

@@ -83,7 +83,14 @@ export function createBrokerSocketHandler(appClient, options = {}) {
   }
 
   async function interruptActiveStream(stream = activeStream) {
-    if (!stream || activeStream !== stream || stream.interrupting || !stream.ownerClosed || !stream.threadId || !stream.turnId) {
+    if (
+      !stream ||
+      activeStream !== stream ||
+      stream.interrupting ||
+      !stream.ownerClosed ||
+      !stream.threadId ||
+      !stream.turnId
+    ) {
       return;
     }
 
@@ -180,7 +187,7 @@ export function createBrokerSocketHandler(appClient, options = {}) {
         } catch (error) {
           send(socket, {
             id: null,
-            error: buildJsonRpcError(-32700, `Invalid JSON: ${error.message}`)
+            error: buildJsonRpcError(-32700, `Invalid JSON: ${error instanceof Error ? error.message : String(error)}`)
           });
           continue;
         }
@@ -216,7 +223,8 @@ export function createBrokerSocketHandler(appClient, options = {}) {
           isInterruptRequest(message) && activeStream?.socket && activeStream.socket !== socket && !activeRequestSocket;
 
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStream?.socket && activeStream.socket !== socket)) &&
+          ((activeRequestSocket && activeRequestSocket !== socket) ||
+            (activeStream?.socket && activeStream.socket !== socket)) &&
           !allowInterruptDuringActiveStream
         ) {
           send(socket, {
@@ -290,7 +298,9 @@ export function createBrokerSocketHandler(appClient, options = {}) {
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error(
+      "Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]"
+    );
   }
 
   const { options } = parseArgs(argv, {

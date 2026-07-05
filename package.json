@@ -6,17 +6,24 @@
   "description": "Use Codex from Claude Code to review code, delegate tasks, or ask for advice.",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=18.18.0"
+    "node": ">=20.19.0"
   },
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/bump-version.mjs --check",
-    "prebuild": "mkdir -p plugins/codex/.generated/app-server-types && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
-    "build": "tsc -p tsconfig.app-server.json",
+    "prebuild": "node -e \"require('node:fs').mkdirSync('plugins/codex/.generated/app-server-types',{recursive:true})\" && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
+    "@eslint/js": "^9.13.0",
+    "@types/node": "^20.19.0",
+    "eslint": "^9.13.0",
+    "globals": "^15.11.0",
+    "prettier": "^3.3.3",
     "typescript": "^6.0.2"
   }
 }

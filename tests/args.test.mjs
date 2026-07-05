@@ -34,10 +34,9 @@ test("parseArgs parses boolean flags including inline =false", () => {
 test("parseArgs parses value options inline, spaced, and aliased", () => {
   assert.deepEqual(parseArgs(["--model", "gpt"], { valueOptions: ["model"] }).options, { model: "gpt" });
   assert.deepEqual(parseArgs(["--model=gpt"], { valueOptions: ["model"] }).options, { model: "gpt" });
-  assert.deepEqual(
-    parseArgs(["-m", "gpt"], { valueOptions: ["model"], aliasMap: { m: "model" } }).options,
-    { model: "gpt" }
-  );
+  assert.deepEqual(parseArgs(["-m", "gpt"], { valueOptions: ["model"], aliasMap: { m: "model" } }).options, {
+    model: "gpt"
+  });
 });
 
 test("parseArgs collects positionals, unknown flags, and honors --", () => {

@@ -1,16 +1,22 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import {
-  readJobFile,
-  resolveJobFile,
-  resolveJobLogFile,
-  sweepJobs,
-  updateJobFile,
-  writeJobFile
-} from "./state.mjs";
+import { readJobFile, resolveJobFile, resolveJobLogFile, sweepJobs, updateJobFile, writeJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./constants.mjs";
 import { getProcessStartTime } from "./process.mjs";
+
+/**
+ * @typedef {{
+ *   message: string,
+ *   phase: string | null,
+ *   threadId: string | null,
+ *   turnId: string | null,
+ *   stderrMessage: string | null,
+ *   logTitle: string | null,
+ *   logBody: string | null
+ * }} ProgressEvent
+ * @typedef {(event: ProgressEvent) => void} ProgressEventHandler
+ */
 
 export function nowIso() {
   return new Date().toISOString();
@@ -114,6 +120,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   };
 }
 
+/**
+ * @param {{ stderr?: boolean, logFile?: string | null, onEvent?: ProgressEventHandler | null }} [options]
+ */
 export function createProgressReporter({ stderr = false, logFile = null, onEvent = null } = {}) {
   if (!stderr && !logFile && !onEvent) {
     return null;

@@ -7,14 +7,7 @@ import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import {
-  initGitRepo,
-  makeTempDir,
-  readStateFixture,
-  run,
-  seedStateFixture,
-  writeJobFixture
-} from "./helpers.mjs";
+import { initGitRepo, makeTempDir, readStateFixture, run, seedStateFixture, writeJobFixture } from "./helpers.mjs";
 import { createBrokerSocketHandler } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
@@ -66,11 +59,13 @@ class BrokerTestSocket extends EventEmitter {
   }
 
   message(id) {
-    return this.output
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line))
-      .find((message) => message.id === id) ?? null;
+    return (
+      this.output
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .find((message) => message.id === id) ?? null
+    );
   }
 }
 
@@ -263,7 +258,9 @@ test("transfer delegates the current Claude session directly to native import", 
       { type: "user", cwd: repo, message: { role: "user", content: "Initial request" } },
       { type: "assistant", cwd: repo, message: { role: "assistant", content: "Initial answer" } },
       { type: "user", cwd: repo, message: { role: "user", content: "/codex:transfer" } }
-    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n",
     "utf8"
   );
   const result = run("node", [SCRIPT, "transfer", "--json"], {
@@ -502,7 +499,10 @@ test("review includes reasoning output when the app server returns it", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Reasoning:/);
-  assert.match(result.stdout, /Reviewed the changed files and checked the likely regression paths first|Reviewed the changed files and checked the likely regression paths/i);
+  assert.match(
+    result.stdout,
+    /Reviewed the changed files and checked the likely regression paths first|Reviewed the changed files and checked the likely regression paths/i
+  );
 });
 
 test("review logs reasoning summaries and review output to the job log", () => {
@@ -561,41 +561,41 @@ test("task-resume-candidate returns the latest task thread from the current sess
   fs.mkdirSync(jobsDir, { recursive: true });
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-current",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Investigate the flaky test",
-            updatedAt: "2026-03-24T20:00:00.000Z"
-          },
-          {
-            id: "task-other-session",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old task run",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          },
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_review",
-            summary: "Review main...HEAD",
-            updatedAt: "2026-03-24T20:10:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "task-current",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        threadId: "thr_current",
+        summary: "Investigate the flaky test",
+        updatedAt: "2026-03-24T20:00:00.000Z"
+      },
+      {
+        id: "task-other-session",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Old task run",
+        updatedAt: "2026-03-24T20:05:00.000Z"
+      },
+      {
+        id: "review-current",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
+        threadId: "thr_review",
+        summary: "Review main...HEAD",
+        updatedAt: "2026-03-24T20:10:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
     cwd: workspace,
@@ -669,21 +669,21 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other-running",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Other session active task",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "task-other-running",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Other session active task",
+        updatedAt: "2026-03-24T20:05:00.000Z"
+      }
+    ]
+  });
 
   const env = {
     ...buildEnv(binDir),
@@ -1001,14 +1001,11 @@ test("brokered app-server errors expose the child stderr tail on the broker clie
       brokerClient.pending.set(2, { resolve, reject, method: "turn/start" });
       brokerClient.handleLine(JSON.stringify(turnResponse));
     });
-    await assert.rejects(
-      rejection,
-      (error) => {
-        assert.match(error.message, /turn\/start failed with stderr/);
-        assert.match(error.data?.data?.stderr ?? "", /broker stderr tail marker/);
-        return true;
-      }
-    );
+    await assert.rejects(rejection, (error) => {
+      assert.match(error.message, /turn\/start failed with stderr/);
+      assert.match(error.data?.data?.stderr ?? "", /broker stderr tail marker/);
+      return true;
+    });
     assert.equal(brokerClient.stderr, turnResponse.error.data.stderr);
   } finally {
     await appClient?.close().catch(() => {});
@@ -1246,37 +1243,37 @@ test("status shows phases, hints, and the latest finished job", () => {
   );
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-live",
-            kind: "review",
-            kindLabel: "review",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            phase: "reviewing",
-            threadId: "thr_1",
-            summary: "Review working tree diff",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:03.000Z"
-          },
-          {
-            id: "review-done",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            threadId: "thr_done",
-            summary: "Review main...HEAD",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            startedAt: "2026-03-18T15:10:05.000Z",
-            completedAt: "2026-03-18T15:11:10.000Z",
-            updatedAt: "2026-03-18T15:11:10.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-live",
+        kind: "review",
+        kindLabel: "review",
+        status: "running",
+        title: "Codex Review",
+        jobClass: "review",
+        phase: "reviewing",
+        threadId: "thr_1",
+        summary: "Review working tree diff",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:30:03.000Z"
+      },
+      {
+        id: "review-done",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        threadId: "thr_done",
+        summary: "Review main...HEAD",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        startedAt: "2026-03-18T15:10:05.000Z",
+        completedAt: "2026-03-18T15:11:10.000Z",
+        updatedAt: "2026-03-18T15:11:10.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
@@ -1284,8 +1281,14 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
+  assert.match(
+    result.stdout,
+    /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/
+  );
+  assert.match(
+    result.stdout,
+    /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/
+  );
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
@@ -1313,41 +1316,41 @@ test("status without a job id only shows jobs from the current Claude session", 
   fs.writeFileSync(otherLog, "[2026-03-18T15:31:00.000Z] Reviewer started: old changes\n", "utf8");
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-current",
-            kind: "review",
-            kindLabel: "review",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            phase: "reviewing",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Current session review",
-            logFile: currentLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:00.000Z"
-          },
-          {
-            id: "review-other",
-            kind: "review",
-            kindLabel: "review",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Previous session review",
-            createdAt: "2026-03-18T15:20:00.000Z",
-            startedAt: "2026-03-18T15:20:05.000Z",
-            completedAt: "2026-03-18T15:21:00.000Z",
-            updatedAt: "2026-03-18T15:21:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-current",
+        kind: "review",
+        kindLabel: "review",
+        status: "running",
+        title: "Codex Review",
+        jobClass: "review",
+        phase: "reviewing",
+        sessionId: "sess-current",
+        threadId: "thr_current",
+        summary: "Current session review",
+        logFile: currentLog,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:30:00.000Z"
+      },
+      {
+        id: "review-other",
+        kind: "review",
+        kindLabel: "review",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Previous session review",
+        createdAt: "2026-03-18T15:20:00.000Z",
+        startedAt: "2026-03-18T15:20:05.000Z",
+        completedAt: "2026-03-18T15:21:00.000Z",
+        updatedAt: "2026-03-18T15:21:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace,
@@ -1358,10 +1361,7 @@ test("status without a job id only shows jobs from the current Claude session", 
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(
-    [...new Set(result.stdout.match(/review-(?:current|other)/g) ?? [])],
-    ["review-current"]
-  );
+  assert.deepEqual([...new Set(result.stdout.match(/review-(?:current|other)/g) ?? [])], ["review-current"]);
 });
 
 test("status preserves adversarial review kind labels", () => {
@@ -1374,37 +1374,37 @@ test("status preserves adversarial review kind labels", () => {
   fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Reviewer started: adversarial review\n", "utf8");
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-adv-live",
-            kind: "adversarial-review",
-            status: "running",
-            title: "Codex Adversarial Review",
-            jobClass: "review",
-            phase: "reviewing",
-            threadId: "thr_adv_live",
-            summary: "Adversarial review current changes",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:00.000Z"
-          },
-          {
-            id: "review-adv",
-            kind: "adversarial-review",
-            status: "completed",
-            title: "Codex Adversarial Review",
-            jobClass: "review",
-            threadId: "thr_adv_done",
-            summary: "Adversarial review working tree diff",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            startedAt: "2026-03-18T15:10:05.000Z",
-            completedAt: "2026-03-18T15:11:10.000Z",
-            updatedAt: "2026-03-18T15:11:10.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-adv-live",
+        kind: "adversarial-review",
+        status: "running",
+        title: "Codex Adversarial Review",
+        jobClass: "review",
+        phase: "reviewing",
+        threadId: "thr_adv_live",
+        summary: "Adversarial review current changes",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:30:00.000Z"
+      },
+      {
+        id: "review-adv",
+        kind: "adversarial-review",
+        status: "completed",
+        title: "Codex Adversarial Review",
+        jobClass: "review",
+        threadId: "thr_adv_done",
+        summary: "Adversarial review working tree diff",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        startedAt: "2026-03-18T15:10:05.000Z",
+        completedAt: "2026-03-18T15:11:10.000Z",
+        updatedAt: "2026-03-18T15:11:10.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
@@ -1441,22 +1441,22 @@ test("status --wait times out cleanly when a job is still active", () => {
   );
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            summary: "Investigate flaky test",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            startedAt: "2026-03-18T15:30:01.000Z",
-            updatedAt: "2026-03-18T15:30:02.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
     cwd: workspace
@@ -1497,21 +1497,21 @@ test("result returns the stored output for the latest finished job by default", 
   );
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-finished",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            threadId: "thr_review_finished",
-            summary: "Review working tree diff",
-            createdAt: "2026-03-18T15:00:00.000Z",
-            updatedAt: "2026-03-18T15:01:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-finished",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        threadId: "thr_review_finished",
+        summary: "Review working tree diff",
+        createdAt: "2026-03-18T15:00:00.000Z",
+        updatedAt: "2026-03-18T15:01:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace
@@ -1627,33 +1627,33 @@ test("result without a job id prefers the latest finished job from the current C
   );
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Current session review",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            updatedAt: "2026-03-18T15:11:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old session review",
-            createdAt: "2026-03-18T15:20:00.000Z",
-            updatedAt: "2026-03-18T15:21:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-current",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
+        threadId: "thr_current",
+        summary: "Current session review",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        updatedAt: "2026-03-18T15:11:00.000Z"
+      },
+      {
+        id: "review-other",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Old session review",
+        createdAt: "2026-03-18T15:20:00.000Z",
+        updatedAt: "2026-03-18T15:21:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace,
@@ -1739,23 +1739,23 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     "utf8"
   );
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            summary: "Investigate flaky test",
-            pid: sleeper.pid,
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            startedAt: "2026-03-18T15:30:01.000Z",
-            updatedAt: "2026-03-18T15:30:02.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        pid: sleeper.pid,
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
+      }
+    ]
+  });
 
   const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
     cwd: workspace
@@ -1792,21 +1792,21 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            summary: "Other session run",
-            updatedAt: "2026-03-24T20:05:00.000Z",
-            logFile
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "task-other",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        summary: "Other session run",
+        updatedAt: "2026-03-24T20:05:00.000Z",
+        logFile
+      }
+    ]
+  });
 
   const env = {
     ...process.env,
@@ -1839,21 +1839,21 @@ test("cancel with a job id can still target an active job from another Claude se
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            summary: "Other session run",
-            updatedAt: "2026-03-24T20:05:00.000Z",
-            logFile
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "task-other",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        summary: "Other session run",
+        updatedAt: "2026-03-24T20:05:00.000Z",
+        logFile
+      }
+    ]
+  });
 
   const env = {
     ...process.env,
@@ -1892,14 +1892,17 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.ok(jobId);
 
   const stateDir = resolveStateDir(repo);
-  const runningJob = await waitFor(() => {
-    const state = readStateFixture(stateDir);
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
-    if (job?.status === "running" && job.threadId && job.turnId) {
-      return job;
-    }
-    return null;
-  }, { timeoutMs: 15000 });
+  const runningJob = await waitFor(
+    () => {
+      const state = readStateFixture(stateDir);
+      const job = state.jobs.find((candidate) => candidate.id === jobId);
+      if (job?.status === "running" && job.threadId && job.turnId) {
+        return job;
+      }
+      return null;
+    },
+    { timeoutMs: 15000 }
+  );
 
   const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,
@@ -1978,39 +1981,39 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-completed",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            logFile: completedLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:31:00.000Z"
-          },
-          {
-            id: "review-running",
-            status: "running",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            pid: sleeper.pid,
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-other",
-            logFile: otherSessionLog,
-            createdAt: "2026-03-18T15:34:00.000Z",
-            updatedAt: "2026-03-18T15:35:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-completed",
+        status: "completed",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        logFile: completedLog,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:31:00.000Z"
+      },
+      {
+        id: "review-running",
+        status: "running",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        pid: sleeper.pid,
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      },
+      {
+        id: "review-other",
+        status: "completed",
+        title: "Codex Review",
+        sessionId: "sess-other",
+        logFile: otherSessionLog,
+        createdAt: "2026-03-18T15:34:00.000Z",
+        updatedAt: "2026-03-18T15:35:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2043,7 +2046,10 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   const state = readStateFixture(stateDir);
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
+  assert.deepEqual(
+    state.jobs.map((job) => job.id),
+    ["review-other"]
+  );
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
 });
@@ -2120,23 +2126,23 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   fs.writeFileSync(runningLog, "running\n", "utf8");
 
   seedStateFixture(stateDir, {
-        version: 1,
-        config: {
-          stopReviewGate: false
-        },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: {
+      stopReviewGate: false
+    },
+    jobs: [
+      {
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const blocked = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2642,21 +2648,21 @@ test("stop hook labels a running ask job as ask", () => {
   const runningLog = path.join(jobsDir, "ask-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "ask-live",
-            status: "running",
-            title: "Codex Advisor",
-            jobClass: "ask",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "ask-live",
+        status: "running",
+        title: "Codex Advisor",
+        jobClass: "ask",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2746,7 +2752,10 @@ test("explicit --model skips the config lookup entirely", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "do the thing"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
 
   assert.equal(result.status, 0, result.stderr);
   const state = readFakeState(binDir);
@@ -2832,7 +2841,10 @@ test("task --resume-last keeps the null model on the resumed thread", () => {
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.equal(readFakeState(binDir).lastTurnStart.model, null);
 
-  const explicitResume = run("node", [SCRIPT, "task", "--resume-last", "--model", "spark", "one more"], { cwd: repo, env });
+  const explicitResume = run("node", [SCRIPT, "task", "--resume-last", "--model", "spark", "one more"], {
+    cwd: repo,
+    env
+  });
   assert.equal(explicitResume.status, 0, explicitResume.stderr);
   assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.3-codex-spark");
 });
@@ -2906,21 +2918,21 @@ test("stop hook labels a running review job as review", () => {
   const runningLog = path.join(jobsDir, "review-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-live",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "review-live",
+        status: "running",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2943,22 +2955,22 @@ test("stop hook falls back to legacy job kind when jobClass is absent", () => {
   const runningLog = path.join(jobsDir, "review-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "legacy-review-live",
-            kind: "review",
-            kindLabel: "task",
-            status: "running",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "legacy-review-live",
+        kind: "review",
+        kindLabel: "task",
+        status: "running",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2978,20 +2990,20 @@ test("result without a job id reports a first-ever running ask as still running"
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
   seedStateFixture(stateDir, {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "ask-live",
-            status: "running",
-            title: "Codex Advisor",
-            jobClass: "ask",
-            sessionId: "sess-current",
-            summary: "Live advisor question",
-            updatedAt: "2099-01-01T00:00:00.000Z"
-          }
-        ]
-      });
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
+      {
+        id: "ask-live",
+        status: "running",
+        title: "Codex Advisor",
+        jobClass: "ask",
+        sessionId: "sess-current",
+        summary: "Live advisor question",
+        updatedAt: "2099-01-01T00:00:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: repo,

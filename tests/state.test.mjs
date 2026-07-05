@@ -136,7 +136,11 @@ test("getConfig defaults when missing, warns-and-defaults when corrupt, migrates
   );
   assert.equal(getConfig(legacy).stopReviewGate, true, "legacy config should migrate");
   setConfig(legacy, "stopReviewGate", true);
-  assert.equal(fs.existsSync(path.join(resolveStateDir(legacy), "state.json")), false, "legacy file removed after write");
+  assert.equal(
+    fs.existsSync(path.join(resolveStateDir(legacy), "state.json")),
+    false,
+    "legacy file removed after write"
+  );
   assert.equal(getConfig(legacy).stopReviewGate, true);
 });
 

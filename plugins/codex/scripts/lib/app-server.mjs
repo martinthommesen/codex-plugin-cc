@@ -145,7 +145,9 @@ class AppServerClientBase {
         if (this.transport === "broker" && typeof message.error?.data?.stderr === "string") {
           this.stderr = message.error.data.stderr;
         }
-        pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
+        pending.reject(
+          createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error)
+        );
       } else {
         pending.resolve(message.result ?? {});
       }
@@ -341,7 +343,8 @@ export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
     if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
+      brokerEndpoint =
+        options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }

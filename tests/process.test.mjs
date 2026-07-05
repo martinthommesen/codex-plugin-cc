@@ -49,7 +49,7 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
         args,
         status: 128,
         signal: null,
-        stdout: "ERROR: The process \"1234\" not found.",
+        stdout: 'ERROR: The process "1234" not found.',
         stderr: "",
         error: null
       };
@@ -95,10 +95,12 @@ test("resolveExecutable leaves an explicit path untouched", () => {
   assert.equal(resolveExecutable(explicit, { platform: "win32", env: { PATH: "", PATHEXT: ".EXE" } }), explicit);
 });
 
-test("getProcessStartTime returns a value for a live process", () => {
-  const startTime = getProcessStartTime(process.pid);
-  assert.equal(typeof startTime, "string");
-  assert.ok(startTime.length > 0);
+test("getProcessStartTime returns a value from a platform process lookup", () => {
+  const startTime = getProcessStartTime(4242, {
+    platform: "darwin",
+    runCommandImpl: () => ({ stdout: "Mon Jan  1 00:00:00 2024\n" })
+  });
+  assert.equal(startTime, "posix:Mon Jan  1 00:00:00 2024");
 });
 
 test("terminateProcessTree group-kills when the process identity matches", () => {

@@ -158,7 +158,7 @@ export function writeFileAtomic(file, data, mode = 0o600) {
     try {
       fd = fs.openSync(tmp, "wx", mode); // exclusive create at mode (umask can only lower it)
     } catch (error) {
-      if (error && error.code === "EEXIST") {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code === "EEXIST") {
         continue; // vanishingly rare name collision; pick another
       }
       throw error;
@@ -177,7 +177,8 @@ export function writeFileAtomic(file, data, mode = 0o600) {
       fs.renameSync(tmp, file);
       return;
     } catch (error) {
-      const transient = error && (error.code === "EPERM" || error.code === "EBUSY" || error.code === "EACCES");
+      const errorCode = /** @type {NodeJS.ErrnoException} */ (error).code;
+      const transient = errorCode === "EPERM" || errorCode === "EBUSY" || errorCode === "EACCES";
       if (transient && attempt < 20) {
         continue;
       }
@@ -379,7 +380,7 @@ function isPidAlive(pid) {
     return true;
   } catch (error) {
     // ESRCH = gone; EPERM = exists but owned by someone we can't signal.
-    return Boolean(error) && error.code === "EPERM";
+    return /** @type {NodeJS.ErrnoException} */ (error).code === "EPERM";
   }
 }
 

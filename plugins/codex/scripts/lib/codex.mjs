@@ -6,6 +6,9 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
+ * @typedef {Turn | { id: string, status: string }} CapturedTurn
+ * @typedef {{ name?: unknown }} ProviderConfig
+ * @typedef {{ rpcCode?: unknown, code?: unknown, message?: unknown }} RpcLikeError
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
@@ -18,7 +21,7 @@
  *   completion: Promise<TurnCaptureState>,
  *   resolveCompletion: (state: TurnCaptureState) => void,
  *   rejectCompletion: (error: unknown) => void,
- *   finalTurn: Turn | null,
+ *   finalTurn: CapturedTurn | null,
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
  *   pendingCollaborations: Set<string>,
@@ -122,7 +125,9 @@ function collectTouchedFiles(fileChanges) {
 }
 
 function normalizeReasoningText(text) {
-  return String(text ?? "").replace(/\s+/g, " ").trim();
+  return String(text ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function extractReasoningSections(value) {
@@ -287,8 +292,11 @@ function describeCompletedItem(state, item) {
 
 /** @returns {TurnCaptureState} */
 function createTurnCaptureState(threadId, options = {}) {
+  /** @type {((state: TurnCaptureState) => void) | undefined} */
   let resolveCompletion;
+  /** @type {((error: unknown) => void) | undefined} */
   let rejectCompletion;
+  /** @type {Promise<TurnCaptureState>} */
   const completion = new Promise((resolve, reject) => {
     resolveCompletion = resolve;
     rejectCompletion = reject;
@@ -303,8 +311,8 @@ function createTurnCaptureState(threadId, options = {}) {
     turnId: null,
     bufferedNotifications: [],
     completion,
-    resolveCompletion,
-    rejectCompletion,
+    resolveCompletion: /** @type {(state: TurnCaptureState) => void} */ (resolveCompletion),
+    rejectCompletion: /** @type {(error: unknown) => void} */ (rejectCompletion),
     finalTurn: null,
     completed: false,
     finalAnswerSeen: false,
@@ -329,6 +337,11 @@ function clearCompletionTimer(state) {
   }
 }
 
+/**
+ * @param {TurnCaptureState} state
+ * @param {Turn | null} [turn]
+ * @param {{ inferred?: boolean }} [options]
+ */
 function completeTurn(state, turn = null, options = {}) {
   if (state.completed) {
     return;
@@ -350,7 +363,11 @@ function completeTurn(state, turn = null, options = {}) {
   }
 
   if (options.inferred) {
-    emitProgress(state.onProgress, "Turn completion inferred after the main thread finished and subagent work drained.", "finalizing");
+    emitProgress(
+      state.onProgress,
+      "Turn completion inferred after the main thread finished and subagent work drained.",
+      "finalizing"
+    );
   }
 
   state.resolveCompletion(state);
@@ -421,7 +438,9 @@ function recordItem(state, item, lifecycle, threadId = null) {
       if (lifecycle === "completed") {
         const sourceLabel = labelForThread(state, threadId);
         emitLogEvent(state.onProgress, {
-          message: sourceLabel ? `Subagent ${sourceLabel}: ${shorten(item.text, 96)}` : `Assistant message captured: ${shorten(item.text, 96)}`,
+          message: sourceLabel
+            ? `Subagent ${sourceLabel}: ${shorten(item.text, 96)}`
+            : `Assistant message captured: ${shorten(item.text, 96)}`,
           stderrMessage: null,
           phase: item.phase === "final_answer" ? "finalizing" : null,
           logTitle: sourceLabel ? `Subagent ${sourceLabel} message` : "Assistant message",
@@ -558,10 +577,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
+      if (previousHandler) {
+        previousHandler(message);
+      }
+      return;
     }
 
     applyTurnNotification(state, message);
@@ -605,9 +624,10 @@ async function withAppServer(cwd, fn) {
     return result;
   } catch (error) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
+    const typedError = /** @type {RpcLikeError} */ (error);
     const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (client?.transport === "broker" && typedError.rpcCode === BROKER_BUSY_RPC_CODE) ||
+      (brokerRequested && (typedError.code === "ENOENT" || typedError.code === "ECONNREFUSED"));
 
     if (client) {
       await client.close().catch(() => {});
@@ -724,7 +744,7 @@ async function startThread(client, cwd, options = {}) {
     } catch (err) {
       // Only suppress "unknown variant/method" errors from older CLI versions
       // that don't support thread/name/set. Rethrow auth, network, or server errors.
-      const msg = String(err?.message ?? err ?? "");
+      const msg = String(/** @type {RpcLikeError} */ (err)?.message ?? err ?? "");
       if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
         throw err;
       }
@@ -752,6 +772,10 @@ function normalizeProviderId(value) {
   return providerId || null;
 }
 
+/**
+ * @param {string | null} providerId
+ * @param {ProviderConfig | null} [providerConfig]
+ */
 function formatProviderLabel(providerId, providerConfig = null) {
   const configuredName = typeof providerConfig?.name === "string" ? providerConfig.name.trim() : "";
   if (configuredName) {
@@ -872,7 +896,12 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 // Fallback to DEFAULT_MODEL only when nobody chose: explicit --model wins without an RPC,
 // a Codex-config model (or any non-openai provider) wins by passing null so Codex-side
 // config layering stays authoritative.
-async function resolveEffectiveModel(client, cwd, requestedModel, { configModelKeys = ["model"], onProgress = null } = {}) {
+async function resolveEffectiveModel(
+  client,
+  cwd,
+  requestedModel,
+  { configModelKeys = ["model"], onProgress = null } = {}
+) {
   if (requestedModel != null) {
     return requestedModel;
   }
@@ -1011,7 +1040,9 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(
+      "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`."
+    );
   }
 
   return withAppServer(cwd, async (client) => {
@@ -1071,7 +1102,9 @@ export async function runAppServerReview(cwd, options = {}) {
 export async function importExternalAgentSession(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(
+      "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`."
+    );
   }
   if (!options.sourcePath) {
     throw new Error("A Claude session source path is required.");
@@ -1082,7 +1115,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
     try {
       await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
-      if (error?.rpcCode === -32601) {
+      if (/** @type {RpcLikeError} */ (error).rpcCode === -32601) {
         throw new Error(
           "This Codex version does not support Claude session transfer. Update Codex with `npm install -g @openai/codex@latest`, then retry.",
           { cause: error }
@@ -1108,14 +1141,16 @@ export async function importExternalAgentSession(cwd, options = {}) {
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(
+      "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`."
+    );
   }
 
   return withAppServer(cwd, async (client) => {
     // Resumed threads keep their creation-time model choice: pass through only an explicit
     // request and never inject the fallback.
     const model = options.resumeThreadId
-      ? options.model ?? null
+      ? (options.model ?? null)
       : await resolveEffectiveModel(client, cwd, options.model ?? null, {
           configModelKeys: options.configModelKeys ?? ["model"],
           onProgress: options.onProgress
@@ -1136,7 +1171,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
+        threadName: options.persistThread ? options.threadName : (options.threadName ?? null)
       });
       threadId = response.thread.id;
     }
@@ -1183,7 +1218,9 @@ export async function runAppServerTurn(cwd, options = {}) {
 export async function findLatestThreadByPrefix(cwd, prefix) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(
+      "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`."
+    );
   }
 
   return withAppServer(cwd, async (client) => {
@@ -1195,10 +1232,7 @@ export async function findLatestThreadByPrefix(cwd, prefix) {
       searchTerm: prefix
     });
 
-    return (
-      response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(prefix)) ??
-      null
-    );
+    return response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(prefix)) ?? null;
   });
 }
 
@@ -1226,7 +1260,7 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   } catch (error) {
     return {
       parsed: null,
-      parseError: error.message,
+      parseError: error instanceof Error ? error.message : String(error),
       rawOutput,
       ...fallback
     };

@@ -42,29 +42,35 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
 }
 
 export async function sendBrokerShutdown(endpoint) {
-  await new Promise((resolve) => {
-    const socket = connectToEndpoint(endpoint);
-    socket.setEncoding("utf8");
-    socket.on("connect", () => {
-      socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
-    });
-    socket.on("data", () => {
-      socket.end();
-      resolve();
-    });
-    socket.on("error", resolve);
-    socket.on("close", resolve);
-  });
+  await /** @type {Promise<void>} */ (
+    new Promise((resolve) => {
+      const socket = connectToEndpoint(endpoint);
+      socket.setEncoding("utf8");
+      socket.on("connect", () => {
+        socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
+      });
+      socket.on("data", () => {
+        socket.end();
+        resolve();
+      });
+      socket.on("error", resolve);
+      socket.on("close", resolve);
+    })
+  );
 }
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
-    cwd,
-    env,
-    detached: true,
-    stdio: ["ignore", logFd, logFd]
-  });
+  const child = spawn(
+    process.execPath,
+    [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile],
+    {
+      cwd,
+      env,
+      detached: true,
+      stdio: ["ignore", logFd, logFd]
+    }
+  );
   child.unref();
   fs.closeSync(logFd);
   return child;
@@ -110,6 +116,21 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+/**
+ * @typedef {{
+ *   scriptPath?: string,
+ *   platform?: NodeJS.Platform,
+ *   timeoutMs?: number,
+ *   env?: NodeJS.ProcessEnv,
+ *   createBrokerEndpoint?: (sessionDir: string, platform?: NodeJS.Platform) => string,
+ *   killProcess?: ((pid: number, options?: object) => unknown) | null
+ * }} EnsureBrokerSessionOptions
+ */
+
+/**
+ * @param {string} cwd
+ * @param {EnsureBrokerSessionOptions} [options]
+ */
 export async function ensureBrokerSession(cwd, options = {}) {
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
@@ -134,9 +155,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
   const endpoint = endpointFactory(sessionDir, options.platform);
   const pidFile = path.join(sessionDir, "broker.pid");
   const logFile = path.join(sessionDir, "broker.log");
-  const scriptPath =
-    options.scriptPath ??
-    fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
+  const scriptPath = options.scriptPath ?? fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
 
   const child = spawnBrokerProcess({
     scriptPath,
@@ -175,6 +194,17 @@ export async function ensureBrokerSession(cwd, options = {}) {
   return session;
 }
 
+/**
+ * @param {{
+ *   endpoint?: string | null,
+ *   pidFile?: string | null,
+ *   logFile?: string | null,
+ *   sessionDir?: string | null,
+ *   pid?: number | null,
+ *   pidStartTime?: string | null,
+ *   killProcess?: ((pid: number, options?: object) => unknown) | null
+ * }} session
+ */
 export function teardownBrokerSession({
   endpoint = null,
   pidFile,
@@ -186,7 +216,7 @@ export function teardownBrokerSession({
 }) {
   if (Number.isFinite(pid) && killProcess) {
     try {
-      killProcess(pid, { expectedStartTime: pidStartTime, requireIdentity: true });
+      killProcess(/** @type {number} */ (pid), { expectedStartTime: pidStartTime, requireIdentity: true });
     } catch {
       // Ignore missing or already-exited broker processes.
     }

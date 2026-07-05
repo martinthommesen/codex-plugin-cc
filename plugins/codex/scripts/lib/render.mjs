@@ -64,9 +64,7 @@ function normalizeReviewResultData(data) {
     verdict: data.verdict.trim(),
     summary: data.summary.trim(),
     findings: data.findings.map((finding, index) => normalizeReviewFinding(finding, index)),
-    next_steps: data.next_steps
-      .filter((step) => typeof step === "string" && step.trim())
-      .map((step) => step.trim())
+    next_steps: data.next_steps.filter((step) => typeof step === "string" && step.trim()).map((step) => step.trim())
   };
 }
 
@@ -76,8 +74,7 @@ function isStructuredReviewStoredResult(storedJob) {
     return false;
   }
   return (
-    Object.prototype.hasOwnProperty.call(result, "result") ||
-    Object.prototype.hasOwnProperty.call(result, "parseError")
+    Object.prototype.hasOwnProperty.call(result, "result") || Object.prototype.hasOwnProperty.call(result, "parseError")
   );
 }
 
@@ -151,7 +148,13 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
     lines.push(`  Result: /codex:result ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
+  if (
+    job.status !== "queued" &&
+    job.status !== "running" &&
+    job.jobClass === "task" &&
+    job.write &&
+    options.showReviewHint
+  ) {
     lines.push("  Review changes: /codex:review --wait");
     lines.push("  Stricter review: /codex:adversarial-review --wait");
   }
@@ -288,12 +291,7 @@ export function renderReviewResult(parsedResult, meta) {
 export function renderNativeReviewResult(result, meta) {
   const stdout = result.stdout.trim();
   const stderr = result.stderr.trim();
-  const lines = [
-    `# Codex ${meta.reviewLabel}`,
-    "",
-    `Target: ${meta.targetLabel}`,
-    ""
-  ];
+  const lines = [`# Codex ${meta.reviewLabel}`, "", `Target: ${meta.targetLabel}`, ""];
 
   if (stdout) {
     lines.push(stdout);
@@ -312,7 +310,7 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderTaskResult(parsedResult, meta) {
+export function renderTaskResult(parsedResult, _meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
   if (rawOutput) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
@@ -324,7 +322,8 @@ export function renderTaskResult(parsedResult, meta) {
 
 export function renderAskResult(payload) {
   const rawOutput = typeof payload?.rawOutput === "string" ? payload.rawOutput : "";
-  const answer = rawOutput.trimEnd() || String(payload?.failureMessage ?? "").trim() || "Codex did not return a final message.";
+  const answer =
+    rawOutput.trimEnd() || String(payload?.failureMessage ?? "").trim() || "Codex did not return a final message.";
   const lines = [];
   if (typeof payload?.status === "number" && payload.status !== 0) {
     lines.push("Codex advisor turn failed.", "");
@@ -440,12 +439,7 @@ export function renderStoredJobResult(job, storedJob) {
     return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
   }
 
-  const lines = [
-    `# ${job.title ?? "Codex Result"}`,
-    "",
-    `Job: ${job.id}`,
-    `Status: ${job.status}`
-  ];
+  const lines = [`# ${job.title ?? "Codex Result"}`, "", `Job: ${job.id}`, `Status: ${job.status}`];
 
   if (threadId) {
     lines.push(`Codex session ID: ${threadId}`);
@@ -468,12 +462,7 @@ export function renderStoredJobResult(job, storedJob) {
 }
 
 export function renderCancelReport(job) {
-  const lines = [
-    "# Codex Cancel",
-    "",
-    `Cancelled ${job.id}.`,
-    ""
-  ];
+  const lines = ["# Codex Cancel", "", `Cancelled ${job.id}.`, ""];
 
   if (job.title) {
     lines.push(`- Title: ${job.title}`);

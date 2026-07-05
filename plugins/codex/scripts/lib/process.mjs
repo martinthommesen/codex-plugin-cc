@@ -110,7 +110,10 @@ export function getProcessStartTime(pid, options = {}) {
       const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
       // Field 22 (starttime). comm (field 2) may contain spaces/parens, so index
       // from after the final ')'; starttime is the 20th field that follows.
-      const afterComm = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+      const afterComm = stat
+        .slice(stat.lastIndexOf(")") + 1)
+        .trim()
+        .split(/\s+/);
       return afterComm[19] ? `linux:${afterComm[19]}` : null;
     }
     if (platform === "win32") {
@@ -160,10 +163,14 @@ export function terminateProcessTree(pid, options = {}) {
   }
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", killGroup ? ["/PID", String(pid), "/T", "/F"] : ["/PID", String(pid), "/F"], {
-      cwd: options.cwd,
-      env: options.env
-    });
+    const result = runCommandImpl(
+      "taskkill",
+      killGroup ? ["/PID", String(pid), "/T", "/F"] : ["/PID", String(pid), "/F"],
+      {
+        cwd: options.cwd,
+        env: options.env
+      }
+    );
 
     if (!result.error && result.status === 0) {
       return { attempted: true, delivered: true, method: "taskkill", result };
@@ -174,12 +181,12 @@ export function terminateProcessTree(pid, options = {}) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 
-    if (result.error?.code === "ENOENT") {
+    if (/** @type {NodeJS.ErrnoException | null} */ (result.error)?.code === "ENOENT") {
       try {
         killImpl(pid);
         return { attempted: true, delivered: true, method: "kill" };
       } catch (error) {
-        if (error?.code === "ESRCH") {
+        if (/** @type {NodeJS.ErrnoException} */ (error).code === "ESRCH") {
           return { attempted: true, delivered: false, method: "kill" };
         }
         throw error;
@@ -198,7 +205,7 @@ export function terminateProcessTree(pid, options = {}) {
       killImpl(pid, "SIGTERM");
       return { attempted: true, delivered: true, method: "process" };
     } catch (error) {
-      if (error?.code === "ESRCH") {
+      if (/** @type {NodeJS.ErrnoException} */ (error).code === "ESRCH") {
         return { attempted: true, delivered: false, method: "process" };
       }
       throw error;
@@ -209,12 +216,12 @@ export function terminateProcessTree(pid, options = {}) {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
   } catch (error) {
-    if (error?.code !== "ESRCH") {
+    if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ESRCH") {
       try {
         killImpl(pid, "SIGTERM");
         return { attempted: true, delivered: true, method: "process" };
       } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
+        if (/** @type {NodeJS.ErrnoException} */ (innerError).code === "ESRCH") {
           return { attempted: true, delivered: false, method: "process" };
         }
         throw innerError;

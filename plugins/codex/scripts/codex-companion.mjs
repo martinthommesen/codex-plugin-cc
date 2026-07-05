@@ -9,21 +9,21 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { STOP_REVIEW_TASK_MARKER } from "./lib/constants.mjs";
 import {
-    ADVISOR_THREAD_PREFIX,
-    buildPersistentThreadName,
-    DEFAULT_CONTINUE_PROMPT,
-    findLatestThreadByPrefix,
-    getCodexAuthStatus,
-    getCodexAvailability,
-    getSessionRuntimeStatus,
-    importExternalAgentSession,
-    interruptAppServerTurn,
-    parseStructuredOutput,
-    readOutputSchema,
-    runAppServerReview,
-    runAppServerTurn,
-    TASK_THREAD_PREFIX
-  } from "./lib/codex.mjs";
+  ADVISOR_THREAD_PREFIX,
+  buildPersistentThreadName,
+  DEFAULT_CONTINUE_PROMPT,
+  findLatestThreadByPrefix,
+  getCodexAuthStatus,
+  getCodexAvailability,
+  getSessionRuntimeStatus,
+  importExternalAgentSession,
+  interruptAppServerTurn,
+  parseStructuredOutput,
+  readOutputSchema,
+  runAppServerReview,
+  runAppServerTurn,
+  TASK_THREAD_PREFIX
+} from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { shorten } from "./lib/text.mjs";
@@ -128,9 +128,7 @@ function normalizeReasoningEffort(effort) {
     return null;
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
-    throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
-    );
+    throw new Error(`Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`);
   }
   return normalized;
 }
@@ -190,7 +188,9 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   }
   if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");
-    nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+    nextSteps.push(
+      "If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`."
+    );
   }
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
@@ -249,7 +249,9 @@ function buildAdversarialReviewPrompt(context, focusText) {
 function ensureCodexAvailable(cwd) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
+    throw new Error(
+      "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`."
+    );
   }
 }
 
@@ -274,7 +276,9 @@ function validateNativeReviewRequest(target, focusText) {
 
   const nativeTarget = buildNativeReviewTarget(target);
   if (!nativeTarget) {
-    throw new Error("This `/codex:review` target is not supported by the built-in reviewer. Retry with `/codex:adversarial-review` for custom targeting.");
+    throw new Error(
+      "This `/codex:review` target is not supported by the built-in reviewer. Retry with `/codex:adversarial-review` for custom targeting."
+    );
   }
 
   return nativeTarget;
@@ -291,11 +295,7 @@ function isActiveJobStatus(status) {
 function findLatestResumableTaskJob(jobs) {
   return (
     jobs.find(
-      (job) =>
-        job.jobClass === "task" &&
-        job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running"
+      (job) => job.jobClass === "task" && job.threadId && job.status !== "queued" && job.status !== "running"
     ) ?? null
   );
 }
@@ -323,7 +323,9 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
+  const activeTask = visibleJobs.find(
+    (job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running")
+  );
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -457,13 +459,15 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary:
+      parsed.parsed?.summary ??
+      parsed.parseError ??
+      firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
   };
 }
-
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
@@ -498,7 +502,9 @@ async function executeTaskRun(request) {
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentThreadName(TASK_THREAD_PREFIX, request.prompt || DEFAULT_CONTINUE_PROMPT)
+    threadName: resumeThreadId
+      ? null
+      : buildPersistentThreadName(TASK_THREAD_PREFIX, request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -950,7 +956,6 @@ async function handleTaskWorker(argv) {
     throw new Error("Missing required --job-id for task-worker.");
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
@@ -1037,7 +1042,6 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentSessionId();
   const jobs = filterJobsForCurrentSession(sortJobsNewestFirst(listJobs(workspaceRoot)));

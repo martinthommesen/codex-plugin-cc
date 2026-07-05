@@ -100,7 +100,7 @@ export function splitRawArgumentString(raw) {
       continue;
     }
 
-    if (character === "'" || character === "\"") {
+    if (character === "'" || character === '"') {
       quote = character;
       continue;
     }
