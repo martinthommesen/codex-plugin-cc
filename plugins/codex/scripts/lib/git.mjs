@@ -65,12 +65,20 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   return totalBytes;
 }
 
+// Resolve a repo/user-supplied ref to a commit SHA. `--end-of-options` guarantees
+// the ref is never parsed as a git option (blocks option-injection like a branch
+// named `--upload-pack=...`), and `^{commit}` + `--verify` reject anything that
+// isn't a real commit. Everything downstream then operates on the hex SHA.
+function resolveRefToCommit(cwd, ref) {
+  return gitChecked(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`]).stdout.trim();
+}
+
 function buildBranchComparison(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+  const baseCommit = resolveRefToCommit(cwd, baseRef);
+  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseCommit]).stdout.trim();
   return {
     mergeBase,
-    commitRange: `${mergeBase}..HEAD`,
-    reviewRange: `${baseRef}...HEAD`
+    commitRange: `${mergeBase}..HEAD`
   };
 }
 

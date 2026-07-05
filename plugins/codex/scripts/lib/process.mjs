@@ -1,15 +1,57 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
+// On Windows, spawn() without a shell needs the exact executable path and cannot
+// run .cmd/.bat scripts at all. Resolve `command` against PATH + PATHEXT so real
+// executables (git.exe, taskkill.exe) run shell-free — their args then reach the
+// process as argv with no shell-metacharacter interpretation.
+export function resolveExecutable(command, { platform = process.platform, env = process.env } = {}) {
+  if (platform !== "win32" || command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
+    return command;
+  }
+  const exts = (env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((ext) => ext.trim())
+    .filter(Boolean);
+  for (const dir of (env.PATH || "").split(";").filter(Boolean)) {
+    for (const ext of ["", ...exts]) {
+      const candidate = path.join(dir, `${command}${ext}`);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return command;
+}
+
+// Decide how to spawn `command`. Real executables run shell-free (argv-safe,
+// closing shell injection for user/repo-derived args such as git refs). Script
+// shims (.cmd/.bat/.ps1 — e.g. the codex npm shim) require a shell; the plugin
+// only ever invokes those with static, non-user args, so that stays injection-safe.
+export function spawnConfigFor(command, { platform = process.platform, env = process.env } = {}) {
+  if (platform !== "win32") {
+    return { command, shell: false };
+  }
+  const resolved = resolveExecutable(command, { platform, env });
+  const ext = path.extname(resolved).toLowerCase();
+  if (ext === ".cmd" || ext === ".bat" || ext === ".ps1") {
+    return { command, shell: true };
+  }
+  return { command: resolved, shell: false };
+}
+
 export function runCommand(command, args = [], options = {}) {
-  const result = spawnSync(command, args, {
+  const spawnConfig = spawnConfigFor(command, { env: options.env ?? process.env });
+  const result = spawnSync(spawnConfig.command, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    shell: spawnConfig.shell,
     windowsHide: true
   });
 
