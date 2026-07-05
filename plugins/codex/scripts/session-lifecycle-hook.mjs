@@ -13,12 +13,10 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { listJobs, removeJob } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
-
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+import { PLUGIN_DATA_ENV, SESSION_ID_ENV } from "./lib/constants.mjs";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -29,7 +27,7 @@ function readHookInput() {
 }
 
 function shellEscape(value) {
-  return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
 }
 
 function appendEnvVar(name, value) {
@@ -45,33 +43,22 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
-    return;
-  }
-
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
+  for (const job of listJobs(workspaceRoot)) {
+    if (job.sessionId !== sessionId) {
       continue;
     }
-    try {
-      terminateProcessTree(job.pid ?? Number.NaN);
-    } catch {
-      // Ignore teardown failures during session shutdown.
+    if (job.status === "queued" || job.status === "running") {
+      try {
+        terminateProcessTree(job.pid ?? Number.NaN, {
+          expectedStartTime: job.pidStartTime ?? null,
+          requireIdentity: true
+        });
+      } catch {
+        // Ignore teardown failures during session shutdown.
+      }
     }
+    removeJob(workspaceRoot, job.id);
   }
-
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-  });
 }
 
 function handleSessionStart(input) {
@@ -96,6 +83,7 @@ async function handleSessionEnd(input) {
   const logFile = brokerSession?.logFile ?? null;
   const sessionDir = brokerSession?.sessionDir ?? null;
   const pid = brokerSession?.pid ?? null;
+  const pidStartTime = brokerSession?.pidStartTime ?? null;
 
   if (brokerEndpoint) {
     await sendBrokerShutdown(brokerEndpoint);
@@ -108,6 +96,7 @@ async function handleSessionEnd(input) {
     logFile,
     sessionDir,
     pid,
+    pidStartTime,
     killProcess: terminateProcessTree
   });
   clearBrokerSession(cwd);

@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
-import { terminateProcessTree } from "./process.mjs";
+import { spawnConfigFor, terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -123,8 +123,9 @@ class AppServerClientBase {
     let message;
     try {
       message = JSON.parse(line);
-    } catch (error) {
-      this.handleExit(createProtocolError(`Failed to parse codex app-server JSONL: ${error.message}`, { line }));
+    } catch {
+      // Tolerate a stray non-JSON stdout line (incidental chatter) instead of
+      // tearing the whole connection down; only a real stream close ends it.
       return;
     }
 
@@ -141,7 +142,12 @@ class AppServerClientBase {
       this.pending.delete(message.id);
 
       if (message.error) {
-        pending.reject(createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error));
+        if (this.transport === "broker" && typeof message.error?.data?.stderr === "string") {
+          this.stderr = message.error.data.stderr;
+        }
+        pending.reject(
+          createProtocolError(message.error.message ?? `codex app-server ${pending.method} failed.`, message.error)
+        );
       } else {
         pending.resolve(message.result ?? {});
       }
@@ -187,11 +193,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    const spawnConfig = spawnConfigFor("codex", { env: this.options.env ?? process.env });
+    this.proc = spawn(spawnConfig.command, ["app-server"], {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+      shell: spawnConfig.shell,
       windowsHide: true
     });
 
@@ -275,7 +282,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 }
 
-class BrokerCodexAppServerClient extends AppServerClientBase {
+export class BrokerCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "broker";
@@ -336,12 +343,13 @@ export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     let brokerEndpoint = null;
     if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
+      brokerEndpoint =
+        options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
       if (!brokerEndpoint && options.reuseExistingBroker) {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+        const brokerSession = await ensureBrokerSession(cwd, { env: options.env, killProcess: terminateProcessTree });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }

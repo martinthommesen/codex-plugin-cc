@@ -6,17 +6,14 @@
     "allowJs": true,
     "checkJs": true,
     "noEmit": true,
-    "strict": false,
+    "strict": true,
     "noImplicitAny": false,
-    "useUnknownInCatchVariables": false,
+    "useUnknownInCatchVariables": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
   "include": [
-    "plugins/codex/scripts/lib/app-server.mjs",
-    "plugins/codex/scripts/lib/codex.mjs",
-    "plugins/codex/scripts/lib/fs.mjs",
-    "plugins/codex/scripts/lib/process.mjs",
+    "plugins/codex/scripts/**/*.mjs",
     "plugins/codex/scripts/lib/app-server-protocol.d.ts",
     "plugins/codex/.generated/app-server-types/**/*.ts"
   ]

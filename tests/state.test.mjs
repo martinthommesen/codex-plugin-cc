@@ -5,7 +5,25 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  assertJobId,
+  ensureStateDir,
+  getConfig,
+  listJobs,
+  readJobFile,
+  resolveConfigFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  setConfig,
+  sweepJobs,
+  updateJobFile,
+  writeCancelMarker,
+  writeFileAtomic,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
+
+const isPosix = process.platform !== "win32";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -24,13 +42,8 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
 
   try {
     const stateDir = resolveStateDir(workspace);
-
     assert.equal(stateDir.startsWith(path.join(pluginDataDir, "state")), true);
     assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
-    assert.match(
-      stateDir,
-      new RegExp(`^${path.join(pluginDataDir, "state").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
-    );
   } finally {
     if (previousPluginDataDir == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;
@@ -40,66 +53,242 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
   }
 });
 
-test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
+test("state directory and job files are created private (POSIX 0700/0600)", { skip: !isPosix }, () => {
   const workspace = makeTempDir();
-  const stateFile = resolveStateFile(workspace);
-  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  ensureStateDir(workspace);
+  const dirMode = fs.statSync(resolveStateDir(workspace)).mode & 0o777;
+  assert.equal(dirMode & 0o077, 0, `state dir must not be group/other accessible, got ${dirMode.toString(8)}`);
 
-  const jobs = Array.from({ length: 51 }, (_, index) => {
-    const jobId = `job-${index}`;
-    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
-    const logFile = resolveJobLogFile(workspace, jobId);
-    const jobFile = resolveJobFile(workspace, jobId);
-    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
-    fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }, null, 2), "utf8");
-    return {
-      id: jobId,
-      status: "completed",
-      logFile,
-      updatedAt,
-      createdAt: updatedAt
-    };
-  });
+  writeJobFile(workspace, "task-abc-1", { status: "queued" });
+  const fileMode = fs.statSync(resolveJobFile(workspace, "task-abc-1")).mode & 0o777;
+  assert.equal(fileMode & 0o077, 0, `job file must not be group/other accessible, got ${fileMode.toString(8)}`);
+});
 
+test("state directory creation tightens existing directory permissions", { skip: !isPosix }, () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+
+  try {
+    const stateDir = resolveStateDir(workspace);
+    const stateRoot = path.dirname(stateDir);
+    const jobsDir = path.join(stateDir, "jobs");
+    fs.mkdirSync(jobsDir, { recursive: true });
+    for (const dir of [stateRoot, stateDir, jobsDir]) {
+      fs.chmodSync(dir, 0o777);
+    }
+
+    ensureStateDir(workspace);
+
+    for (const dir of [stateRoot, stateDir, jobsDir]) {
+      const mode = fs.statSync(dir).mode & 0o777;
+      assert.equal(mode, 0o700, `${dir} mode should be tightened to 0700, got ${mode.toString(8)}`);
+    }
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+test("writeFileAtomic never leaves a torn file and overwrites atomically", () => {
+  const dir = makeTempDir();
+  const target = path.join(dir, "atomic.json");
+  writeFileAtomic(target, "first\n");
+  writeFileAtomic(target, "second\n");
+  assert.equal(fs.readFileSync(target, "utf8"), "second\n");
+  // No leftover temp files.
+  assert.deepEqual(fs.readdirSync(dir), ["atomic.json"]);
+});
+
+test("assertJobId rejects path traversal and separators", () => {
+  assert.equal(assertJobId("task-abc-123"), "task-abc-123");
+  for (const bad of ["../evil", "a/b", "a\\b", "..", ".", "", "with\0null"]) {
+    assert.throws(() => assertJobId(bad), /Invalid job id/, `expected ${JSON.stringify(bad)} to be rejected`);
+  }
+  const workspace = makeTempDir();
+  assert.throws(() => resolveJobFile(workspace, "../escape"), /Invalid job id/);
+});
+
+test("listJobs scans per-job files newest-first and skips unparseable ones", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-old", { status: "completed", updatedAt: "2026-01-01T00:00:00.000Z" });
+  writeJobFile(workspace, "job-new", { status: "completed", updatedAt: "2026-02-01T00:00:00.000Z" });
+  fs.writeFileSync(path.join(resolveStateDir(workspace), "jobs", "job-broken.json"), "{not json", "utf8");
+
+  const jobs = listJobs(workspace);
+  assert.deepEqual(
+    jobs.map((job) => job.id),
+    ["job-new", "job-old"]
+  );
+});
+
+test("listJobs migrates legacy state jobs and stored output into per-job files", () => {
+  const workspace = makeTempDir();
+  ensureStateDir(workspace);
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  const legacyJob = {
+    id: "review-legacy",
+    status: "completed",
+    summary: "legacy summary",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-02T00:00:00.000Z"
+  };
   fs.writeFileSync(
-    stateFile,
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs
-      },
-      null,
-      2
-    )}\n`,
+    path.join(jobsDir, "review-legacy.json"),
+    JSON.stringify({ result: { status: 0 }, rendered: "legacy output\n" }),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [legacyJob] }),
     "utf8"
   );
 
-  saveState(workspace, {
-    version: 1,
-    config: { stopReviewGate: false },
-    jobs
+  const jobs = listJobs(workspace);
+
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].id, "review-legacy");
+  assert.equal(jobs[0].summary, "legacy summary");
+  assert.deepEqual(jobs[0].result, { status: 0 });
+  assert.equal(jobs[0].rendered, "legacy output\n");
+  assert.equal(getConfig(workspace).stopReviewGate, true);
+  assert.equal(fs.existsSync(path.join(stateDir, "state.json")), false);
+});
+
+test("the cancel marker is authoritative on read", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-x", { status: "running" });
+  writeCancelMarker(workspace, "job-x");
+
+  // Even a later completion write cannot un-cancel.
+  writeJobFile(workspace, "job-x", { status: "completed" });
+  assert.equal(readJobFile(resolveJobFile(workspace, "job-x")).status, "cancelled");
+  assert.equal(listJobs(workspace)[0].status, "cancelled");
+});
+
+test("updateJobFile stamps updatedAt and no-ops on a missing record", () => {
+  const workspace = makeTempDir();
+  assert.equal(updateJobFile(workspace, "job-missing", { phase: "x" }), null);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-missing")), false);
+
+  writeJobFile(workspace, "job-y", { status: "running", updatedAt: "2000-01-01T00:00:00.000Z" });
+  const updated = updateJobFile(workspace, "job-y", { phase: "investigating" });
+  assert.equal(updated.phase, "investigating");
+  assert.notEqual(updated.updatedAt, "2000-01-01T00:00:00.000Z");
+});
+
+test("getConfig defaults when missing, warns-and-defaults when corrupt, migrates legacy state.json", () => {
+  const missing = makeTempDir();
+  assert.deepEqual(getConfig(missing), { stopReviewGate: false });
+
+  const corrupt = makeTempDir();
+  ensureStateDir(corrupt);
+  fs.writeFileSync(resolveConfigFile(corrupt), "{ not json", "utf8");
+  assert.deepEqual(getConfig(corrupt), { stopReviewGate: false });
+
+  const legacy = makeTempDir();
+  ensureStateDir(legacy);
+  fs.writeFileSync(
+    path.join(resolveStateDir(legacy), "state.json"),
+    JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }),
+    "utf8"
+  );
+  assert.equal(getConfig(legacy).stopReviewGate, true, "legacy config should migrate");
+  setConfig(legacy, "stopReviewGate", true);
+  assert.equal(
+    fs.existsSync(path.join(resolveStateDir(legacy), "state.json")),
+    false,
+    "legacy file removed after write"
+  );
+  assert.equal(getConfig(legacy).stopReviewGate, true);
+});
+
+test("getConfig migrates the old fallback state root into the uid-scoped root", (t) => {
+  const workspace = makeTempDir();
+  const newStateDir = resolveStateDir(workspace);
+  const oldStateDir = path.join(os.tmpdir(), "codex-companion", path.basename(newStateDir));
+  t.after(() => fs.rmSync(oldStateDir, { recursive: true, force: true }));
+  fs.mkdirSync(oldStateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(oldStateDir, "state.json"),
+    JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [{ id: "task-legacy", status: "running", updatedAt: "2026-01-01T00:00:00.000Z" }]
+    }),
+    "utf8"
+  );
+
+  assert.equal(getConfig(workspace).stopReviewGate, true);
+  assert.equal(listJobs(workspace)[0].id, "task-legacy");
+  assert.equal(resolveStateDir(workspace), newStateDir);
+  assert.equal(fs.existsSync(path.join(oldStateDir, "state.json")), false);
+});
+
+test("sweepJobs caps terminal jobs at 50 keeping the newest", () => {
+  const workspace = makeTempDir();
+  for (let index = 0; index < 51; index += 1) {
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    writeJobFile(workspace, `job-${index}`, { status: "completed", updatedAt });
+    // stamp the log too so pruning removes both
+    fs.writeFileSync(resolveJobLogFile(workspace, `job-${index}`), "log\n", "utf8");
+  }
+
+  sweepJobs(workspace);
+
+  const jobs = listJobs(workspace);
+  assert.equal(jobs.length, 50);
+  assert.equal(
+    jobs.some((job) => job.id === "job-0"),
+    false,
+    "the oldest terminal job should be pruned"
+  );
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-0")), false);
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "job-0")), false);
+});
+
+test("sweepJobs reaps a crashed active job but preserves a live one", () => {
+  const dead = makeTempDir();
+  writeJobFile(dead, "job-dead", { status: "running", pid: 424242, updatedAt: "2026-01-01T00:00:00.000Z" });
+  sweepJobs(dead, { isJobAlive: () => false });
+  assert.equal(listJobs(dead)[0].status, "failed");
+
+  const live = makeTempDir();
+  writeJobFile(live, "job-live", { status: "running", pid: 424242, updatedAt: "2026-01-01T00:00:00.000Z" });
+  sweepJobs(live, { isJobAlive: () => true });
+  assert.equal(listJobs(live)[0].status, "running");
+});
+
+test("sweepJobs verifies stored pid identity before preserving active jobs", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-live", {
+    status: "running",
+    pid: 4242,
+    pidStartTime: "start-a",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  writeJobFile(workspace, "job-recycled", {
+    status: "running",
+    pid: 4243,
+    pidStartTime: "start-b",
+    updatedAt: "2026-01-01T00:01:00.000Z"
   });
 
-  const prunedJobFile = resolveJobFile(workspace, "job-0");
-  const prunedLogFile = resolveJobLogFile(workspace, "job-0");
-  const retainedJobFile = resolveJobFile(workspace, "job-50");
-  const retainedLogFile = resolveJobLogFile(workspace, "job-50");
-  const jobsDir = path.dirname(prunedJobFile);
+  sweepJobs(workspace, {
+    isProcessAlive: () => true,
+    getProcessStartTime(pid) {
+      return pid === 4242 ? "start-a" : "start-c";
+    }
+  });
 
-  assert.equal(fs.existsSync(retainedJobFile), true);
-  assert.equal(fs.existsSync(retainedLogFile), true);
-
-  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-  assert.equal(savedState.jobs.length, 50);
-  assert.deepEqual(
-    savedState.jobs.map((job) => job.id),
-    Array.from({ length: 50 }, (_, index) => `job-${50 - index}`)
-  );
-  assert.deepEqual(
-    fs.readdirSync(jobsDir).sort(),
-    Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
-      .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
-      .sort()
-  );
+  const jobs = Object.fromEntries(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobs["job-live"].status, "running");
+  assert.equal(jobs["job-recycled"].status, "failed");
+  assert.equal(jobs["job-recycled"].pid, null);
+  assert.equal(jobs["job-recycled"].pidStartTime, null);
 });

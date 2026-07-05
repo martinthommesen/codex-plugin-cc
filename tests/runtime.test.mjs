@@ -3,11 +3,19 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
-import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { buildEnv, buildHomeEnv, installFakeCodex, installNodeShim } from "./fake-codex-fixture.mjs";
+import { initGitRepo, makeTempDir, readStateFixture, run, seedStateFixture, writeJobFixture } from "./helpers.mjs";
+import { createBrokerSocketHandler } from "../plugins/codex/scripts/app-server-broker.mjs";
+import { BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
+import {
+  loadBrokerSession,
+  saveBrokerSession,
+  spawnBrokerProcess
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { getProcessStartTime } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,6 +34,49 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+class BrokerTestSocket extends EventEmitter {
+  constructor() {
+    super();
+    this.destroyed = false;
+    this.output = "";
+  }
+
+  setEncoding() {}
+
+  write(chunk) {
+    if (!this.destroyed) {
+      this.output += String(chunk);
+    }
+  }
+
+  end() {
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+    this.emit("close");
+  }
+
+  receive(message) {
+    this.emit("data", `${JSON.stringify(message)}\n`);
+  }
+
+  message(id) {
+    return (
+      this.output
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+        .find((message) => message.id === id) ?? null
+    );
+  }
+}
+
+async function brokerRequest(socket, message) {
+  socket.receive(message);
+  return waitFor(() => socket.message(message.id));
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -47,7 +98,7 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  installNodeShim(binDir);
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,
@@ -212,14 +263,16 @@ test("transfer delegates the current Claude session directly to native import", 
       { type: "user", cwd: repo, message: { role: "user", content: "Initial request" } },
       { type: "assistant", cwd: repo, message: { role: "assistant", content: "Initial answer" } },
       { type: "user", cwd: repo, message: { role: "user", content: "/codex:transfer" } }
-    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n",
     "utf8"
   );
   const result = run("node", [SCRIPT, "transfer", "--json"], {
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      HOME: home,
+      ...buildHomeEnv(home),
       CODEX_HOME: path.join(home, ".codex"),
       CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath
     }
@@ -264,7 +317,7 @@ test("transfer reports an actionable upgrade error when native import is unsuppo
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      HOME: home,
+      ...buildHomeEnv(home),
       CODEX_HOME: path.join(home, ".codex")
     }
   });
@@ -294,7 +347,7 @@ test("transfer fails visibly when native import completes without a ledger recor
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      HOME: home,
+      ...buildHomeEnv(home),
       CODEX_HOME: path.join(home, ".codex")
     }
   });
@@ -320,7 +373,7 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], {
     cwd: repo,
-    env: { ...buildEnv(binDir), HOME: home }
+    env: { ...buildEnv(binDir), ...buildHomeEnv(home) }
   });
 
   assert.notEqual(result.status, 0);
@@ -451,7 +504,10 @@ test("review includes reasoning output when the app server returns it", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Reasoning:/);
-  assert.match(result.stdout, /Reviewed the changed files and checked the likely regression paths first|Reviewed the changed files and checked the likely regression paths/i);
+  assert.match(
+    result.stdout,
+    /Reviewed the changed files and checked the likely regression paths first|Reviewed the changed files and checked the likely regression paths/i
+  );
 });
 
 test("review logs reasoning summaries and review output to the job log", () => {
@@ -471,7 +527,7 @@ test("review logs reasoning summaries and review output to the job log", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Reviewed the changed files and checked the likely regression paths/);
@@ -509,50 +565,42 @@ test("task-resume-candidate returns the latest task thread from the current sess
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-current",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Investigate the flaky test",
-            updatedAt: "2026-03-24T20:00:00.000Z"
-          },
-          {
-            id: "task-other-session",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old task run",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          },
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_review",
-            summary: "Review main...HEAD",
-            updatedAt: "2026-03-24T20:10:00.000Z"
-          }
-        ]
+        id: "task-current",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        threadId: "thr_current",
+        summary: "Investigate the flaky test",
+        updatedAt: "2026-03-24T20:00:00.000Z"
       },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      {
+        id: "task-other-session",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Old task run",
+        updatedAt: "2026-03-24T20:05:00.000Z"
+      },
+      {
+        id: "review-current",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
+        threadId: "thr_review",
+        summary: "Review main...HEAD",
+        updatedAt: "2026-03-24T20:10:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
     cwd: workspace,
@@ -625,30 +673,22 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
 
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other-running",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Other session active task",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "task-other-running",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Other session active task",
+        updatedAt: "2026-03-24T20:05:00.000Z"
+      }
+    ]
+  });
 
   const env = {
     ...buildEnv(binDir),
@@ -800,7 +840,7 @@ test("task logs reasoning summaries and assistant messages to the job log", () =
 
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Reasoning summary/);
   assert.match(log, /Inspected the prompt, gathered evidence, and checked the highest-risk paths first/);
@@ -824,7 +864,7 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const log = fs.readFileSync(state.jobs[0].logFile, "utf8");
   assert.match(log, /Starting subagent design-challenger via collaboration tool: wait\./);
   assert.match(log, /Subagent design-challenger reasoning:/);
@@ -920,6 +960,117 @@ test("task using the shared broker still completes when Codex spawns subagents",
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("brokered app-server errors expose the child stderr tail on the broker client", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-errors-with-stderr");
+  initGitRepo(repo);
+
+  const env = buildEnv(binDir);
+  let appClient = null;
+  try {
+    appClient = await CodexAppServerClient.connect(repo, { env, disableBroker: true });
+    const socket = new BrokerTestSocket();
+    createBrokerSocketHandler(appClient).attach(socket);
+
+    const threadResponse = await brokerRequest(socket, {
+      id: 1,
+      method: "thread/start",
+      params: {
+        cwd: repo,
+        model: null,
+        sandbox: "read-only",
+        ephemeral: true
+      }
+    });
+    const threadId = threadResponse.result.thread.id;
+
+    const turnResponse = await brokerRequest(socket, {
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [{ type: "text", text: "FAIL_THIS_TURN" }],
+        model: null,
+        effort: null,
+        outputSchema: null
+      }
+    });
+
+    assert.equal(turnResponse.error.message, "turn/start failed with stderr");
+    assert.match(turnResponse.error.data.stderr, /broker stderr tail marker/);
+    assert.doesNotMatch(turnResponse.error.data.stderr, /broker stderr head marker/);
+
+    const brokerClient = new BrokerCodexAppServerClient(repo, { brokerEndpoint: "unix:/unused.sock" });
+    const rejection = new Promise((resolve, reject) => {
+      brokerClient.pending.set(2, { resolve, reject, method: "turn/start" });
+      brokerClient.handleLine(JSON.stringify(turnResponse));
+    });
+    await assert.rejects(rejection, (error) => {
+      assert.match(error.message, /turn\/start failed with stderr/);
+      assert.match(error.data?.data?.stderr ?? "", /broker stderr tail marker/);
+      return true;
+    });
+    assert.equal(brokerClient.stderr, turnResponse.error.data.stderr);
+  } finally {
+    await appClient?.close().catch(() => {});
+  }
+});
+
+test("broker interrupts an active turn when the owning client disconnects", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-delayed-turn-start");
+  initGitRepo(repo);
+
+  const env = buildEnv(binDir);
+  let appClient = null;
+  try {
+    appClient = await CodexAppServerClient.connect(repo, { env, disableBroker: true });
+    const socket = new BrokerTestSocket();
+    createBrokerSocketHandler(appClient).attach(socket);
+
+    const threadResponse = await brokerRequest(socket, {
+      id: 1,
+      method: "thread/start",
+      params: {
+        cwd: repo,
+        model: null,
+        sandbox: "workspace-write",
+        ephemeral: true
+      }
+    });
+    const threadId = threadResponse.result.thread.id;
+    socket.receive({
+      id: 2,
+      method: "turn/start",
+      params: {
+        threadId,
+        input: [{ type: "text", text: "keep working until interrupted" }],
+        model: null,
+        effort: null,
+        outputSchema: null
+      }
+    });
+    const startedTurn = await waitFor(() => {
+      const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      return fakeState.lastTurnStart ?? null;
+    });
+
+    socket.end();
+
+    const interrupt = await waitFor(() => {
+      const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+      return fakeState.lastInterrupt ?? null;
+    });
+
+    assert.deepEqual(interrupt, { threadId, turnId: startedTurn.turnId });
+  } finally {
+    await appClient?.close().catch(() => {});
+  }
+});
+
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -938,6 +1089,11 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   const launchPayload = JSON.parse(launched.stdout);
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
+  const queuedJob = await waitFor(() => {
+    const job = readStateFixture(resolveStateDir(repo)).jobs.find((candidate) => candidate.id === launchPayload.jobId);
+    return Number.isFinite(job?.pid) ? job : null;
+  });
+  assert.ok(queuedJob.pid > 0);
 
   const waitedStatus = run(
     "node",
@@ -1096,46 +1252,38 @@ test("status shows phases, hints, and the latest finished job", () => {
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-live",
-            kind: "review",
-            kindLabel: "review",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            phase: "reviewing",
-            threadId: "thr_1",
-            summary: "Review working tree diff",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:03.000Z"
-          },
-          {
-            id: "review-done",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            threadId: "thr_done",
-            summary: "Review main...HEAD",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            startedAt: "2026-03-18T15:10:05.000Z",
-            completedAt: "2026-03-18T15:11:10.000Z",
-            updatedAt: "2026-03-18T15:11:10.000Z"
-          }
-        ]
+        id: "review-live",
+        kind: "review",
+        kindLabel: "review",
+        status: "running",
+        title: "Codex Review",
+        jobClass: "review",
+        phase: "reviewing",
+        threadId: "thr_1",
+        summary: "Review working tree diff",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:30:03.000Z"
       },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      {
+        id: "review-done",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        threadId: "thr_done",
+        summary: "Review main...HEAD",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        startedAt: "2026-03-18T15:10:05.000Z",
+        completedAt: "2026-03-18T15:11:10.000Z",
+        updatedAt: "2026-03-18T15:11:10.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
@@ -1143,8 +1291,14 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
+  assert.match(
+    result.stdout,
+    /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/
+  );
+  assert.match(
+    result.stdout,
+    /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/
+  );
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
@@ -1171,50 +1325,42 @@ test("status without a job id only shows jobs from the current Claude session", 
   fs.writeFileSync(currentLog, "[2026-03-18T15:30:00.000Z] Reviewer started: current changes\n", "utf8");
   fs.writeFileSync(otherLog, "[2026-03-18T15:31:00.000Z] Reviewer started: old changes\n", "utf8");
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-current",
-            kind: "review",
-            kindLabel: "review",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            phase: "reviewing",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Current session review",
-            logFile: currentLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:00.000Z"
-          },
-          {
-            id: "review-other",
-            kind: "review",
-            kindLabel: "review",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Previous session review",
-            createdAt: "2026-03-18T15:20:00.000Z",
-            startedAt: "2026-03-18T15:20:05.000Z",
-            completedAt: "2026-03-18T15:21:00.000Z",
-            updatedAt: "2026-03-18T15:21:00.000Z"
-          }
-        ]
+        id: "review-current",
+        kind: "review",
+        kindLabel: "review",
+        status: "running",
+        title: "Codex Review",
+        jobClass: "review",
+        phase: "reviewing",
+        sessionId: "sess-current",
+        threadId: "thr_current",
+        summary: "Current session review",
+        logFile: currentLog,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:30:00.000Z"
       },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      {
+        id: "review-other",
+        kind: "review",
+        kindLabel: "review",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Previous session review",
+        createdAt: "2026-03-18T15:20:00.000Z",
+        startedAt: "2026-03-18T15:20:05.000Z",
+        completedAt: "2026-03-18T15:21:00.000Z",
+        updatedAt: "2026-03-18T15:21:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace,
@@ -1225,10 +1371,7 @@ test("status without a job id only shows jobs from the current Claude session", 
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(
-    [...new Set(result.stdout.match(/review-(?:current|other)/g) ?? [])],
-    ["review-current"]
-  );
+  assert.deepEqual([...new Set(result.stdout.match(/review-(?:current|other)/g) ?? [])], ["review-current"]);
 });
 
 test("status preserves adversarial review kind labels", () => {
@@ -1240,46 +1383,38 @@ test("status preserves adversarial review kind labels", () => {
   const logFile = path.join(jobsDir, "review-adv.log");
   fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Reviewer started: adversarial review\n", "utf8");
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-adv-live",
-            kind: "adversarial-review",
-            status: "running",
-            title: "Codex Adversarial Review",
-            jobClass: "review",
-            phase: "reviewing",
-            threadId: "thr_adv_live",
-            summary: "Adversarial review current changes",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:30:00.000Z"
-          },
-          {
-            id: "review-adv",
-            kind: "adversarial-review",
-            status: "completed",
-            title: "Codex Adversarial Review",
-            jobClass: "review",
-            threadId: "thr_adv_done",
-            summary: "Adversarial review working tree diff",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            startedAt: "2026-03-18T15:10:05.000Z",
-            completedAt: "2026-03-18T15:11:10.000Z",
-            updatedAt: "2026-03-18T15:11:10.000Z"
-          }
-        ]
+        id: "review-adv-live",
+        kind: "adversarial-review",
+        status: "running",
+        title: "Codex Adversarial Review",
+        jobClass: "review",
+        phase: "reviewing",
+        threadId: "thr_adv_live",
+        summary: "Adversarial review current changes",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:30:00.000Z"
       },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      {
+        id: "review-adv",
+        kind: "adversarial-review",
+        status: "completed",
+        title: "Codex Adversarial Review",
+        jobClass: "review",
+        threadId: "thr_adv_done",
+        summary: "Adversarial review working tree diff",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        startedAt: "2026-03-18T15:10:05.000Z",
+        completedAt: "2026-03-18T15:11:10.000Z",
+        updatedAt: "2026-03-18T15:11:10.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
@@ -1315,31 +1450,23 @@ test("status --wait times out cleanly when a job is still active", () => {
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            summary: "Investigate flaky test",
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            startedAt: "2026-03-18T15:30:01.000Z",
-            updatedAt: "2026-03-18T15:30:02.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
     cwd: workspace
@@ -1379,30 +1506,22 @@ test("result returns the stored output for the latest finished job by default", 
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-finished",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            threadId: "thr_review_finished",
-            summary: "Review working tree diff",
-            createdAt: "2026-03-18T15:00:00.000Z",
-            updatedAt: "2026-03-18T15:01:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "review-finished",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        threadId: "thr_review_finished",
+        summary: "Review working tree diff",
+        createdAt: "2026-03-18T15:00:00.000Z",
+        updatedAt: "2026-03-18T15:01:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace
@@ -1413,6 +1532,62 @@ test("result returns the stored output for the latest finished job by default", 
     result.stdout,
     "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\nResume in Codex: codex resume thr_review_finished\n"
   );
+});
+
+test("stop-gate reviews are hidden from default result/status but visible with --all", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" };
+  seedStateFixture(stateDir, {
+    jobs: [
+      {
+        id: "task-real",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        threadId: "thr_task",
+        summary: "Real user task",
+        rendered: "Real task output.\n",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        updatedAt: "2026-03-18T15:11:00.000Z"
+      },
+      {
+        // Newer than the real task — must NOT displace it in the default view.
+        id: "task-stopgate",
+        status: "completed",
+        title: "Codex Stop Gate Review",
+        jobClass: "stop-review",
+        sessionId: "sess-current",
+        threadId: "thr_stop",
+        summary: "Stop-gate review",
+        rendered: "ALLOW: looks good\n",
+        createdAt: "2026-03-18T15:12:00.000Z",
+        updatedAt: "2026-03-18T15:13:00.000Z"
+      }
+    ]
+  });
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: workspace, env });
+  assert.equal(status.status, 0, status.stderr);
+  const statusReport = JSON.parse(status.stdout);
+  assert.equal(statusReport.latestFinished.id, "task-real");
+  assert.equal(
+    [statusReport.latestFinished.id, ...statusReport.recent.map((job) => job.id)].includes("task-stopgate"),
+    false
+  );
+
+  const statusAll = run("node", [SCRIPT, "status", "--all", "--json"], { cwd: workspace, env });
+  const statusAllReport = JSON.parse(statusAll.stdout);
+  assert.equal(
+    [statusAllReport.latestFinished?.id, ...statusAllReport.recent.map((job) => job.id)].includes("task-stopgate"),
+    true
+  );
+
+  const result = run("node", [SCRIPT, "result"], { cwd: workspace, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Real task output\./);
+  assert.doesNotMatch(result.stdout, /ALLOW: looks good/);
 });
 
 test("result without a job id prefers the latest finished job from the current Claude session", () => {
@@ -1461,42 +1636,34 @@ test("result without a job id prefers the latest finished job from the current C
     "utf8"
   );
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Current session review",
-            createdAt: "2026-03-18T15:10:00.000Z",
-            updatedAt: "2026-03-18T15:11:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old session review",
-            createdAt: "2026-03-18T15:20:00.000Z",
-            updatedAt: "2026-03-18T15:21:00.000Z"
-          }
-        ]
+        id: "review-current",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
+        threadId: "thr_current",
+        summary: "Current session review",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        updatedAt: "2026-03-18T15:11:00.000Z"
       },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      {
+        id: "review-other",
+        status: "completed",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-other",
+        threadId: "thr_other",
+        summary: "Old session review",
+        createdAt: "2026-03-18T15:20:00.000Z",
+        updatedAt: "2026-03-18T15:21:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace,
@@ -1581,32 +1748,24 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     ),
     "utf8"
   );
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            summary: "Investigate flaky test",
-            pid: sleeper.pid,
-            logFile,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            startedAt: "2026-03-18T15:30:01.000Z",
-            updatedAt: "2026-03-18T15:30:02.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        pid: sleeper.pid,
+        logFile,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        startedAt: "2026-03-18T15:30:01.000Z",
+        updatedAt: "2026-03-18T15:30:02.000Z"
+      }
+    ]
+  });
 
   const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
     cwd: workspace
@@ -1624,7 +1783,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const cancelled = state.jobs.find((job) => job.id === "task-live");
   assert.equal(cancelled.status, "cancelled");
   assert.equal(cancelled.pid, null);
@@ -1642,30 +1801,22 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
 
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            summary: "Other session run",
-            updatedAt: "2026-03-24T20:05:00.000Z",
-            logFile
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "task-other",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        summary: "Other session run",
+        updatedAt: "2026-03-24T20:05:00.000Z",
+        logFile
+      }
+    ]
+  });
 
   const env = {
     ...process.env,
@@ -1685,7 +1836,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(cancel.status, 1);
   assert.match(cancel.stderr, /No active Codex jobs to cancel for this session\./);
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   assert.equal(state.jobs[0].status, "running");
 });
 
@@ -1697,30 +1848,22 @@ test("cancel with a job id can still target an active job from another Claude se
 
   const logFile = path.join(jobsDir, "task-other.log");
   fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            summary: "Other session run",
-            updatedAt: "2026-03-24T20:05:00.000Z",
-            logFile
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "task-other",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        summary: "Other session run",
+        updatedAt: "2026-03-24T20:05:00.000Z",
+        logFile
+      }
+    ]
+  });
 
   const env = {
     ...process.env,
@@ -1733,7 +1876,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(cancel.status, 0, cancel.stderr);
   assert.equal(JSON.parse(cancel.stdout).jobId, "task-other");
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
@@ -1759,14 +1902,17 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.ok(jobId);
 
   const stateDir = resolveStateDir(repo);
-  const runningJob = await waitFor(() => {
-    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-    const job = state.jobs.find((candidate) => candidate.id === jobId);
-    if (job?.status === "running" && job.threadId && job.turnId) {
-      return job;
-    }
-    return null;
-  }, { timeoutMs: 15000 });
+  const runningJob = await waitFor(
+    () => {
+      const state = readStateFixture(stateDir);
+      const job = state.jobs.find((candidate) => candidate.id === jobId);
+      if (job?.status === "running" && job.threadId && job.turnId) {
+        return job;
+      }
+      return null;
+    },
+    { timeoutMs: 15000 }
+  );
 
   const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,
@@ -1844,48 +1990,40 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-completed",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            logFile: completedLog,
-            createdAt: "2026-03-18T15:30:00.000Z",
-            updatedAt: "2026-03-18T15:31:00.000Z"
-          },
-          {
-            id: "review-running",
-            status: "running",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            pid: sleeper.pid,
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          },
-          {
-            id: "review-other",
-            status: "completed",
-            title: "Codex Review",
-            sessionId: "sess-other",
-            logFile: otherSessionLog,
-            createdAt: "2026-03-18T15:34:00.000Z",
-            updatedAt: "2026-03-18T15:35:00.000Z"
-          }
-        ]
+        id: "review-completed",
+        status: "completed",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        logFile: completedLog,
+        createdAt: "2026-03-18T15:30:00.000Z",
+        updatedAt: "2026-03-18T15:31:00.000Z"
       },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+      {
+        id: "review-running",
+        status: "running",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        pid: sleeper.pid,
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      },
+      {
+        id: "review-other",
+        status: "completed",
+        title: "Codex Review",
+        sessionId: "sess-other",
+        logFile: otherSessionLog,
+        createdAt: "2026-03-18T15:34:00.000Z",
+        updatedAt: "2026-03-18T15:35:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -1917,10 +2055,95 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     }
   });
 
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
+  const state = readStateFixture(stateDir);
+  assert.deepEqual(
+    state.jobs.map((job) => job.id),
+    ["review-other"]
+  );
   const otherJob = state.jobs[0];
   assert.equal(otherJob.logFile, otherSessionLog);
+});
+
+test(
+  "session end tears down the broker process group with stored pid identity",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const repo = makeTempDir();
+    const childPidFile = path.join(repo, "child.pid");
+    let childPid = null;
+    const parent = spawn(
+      process.execPath,
+      [
+        "-e",
+        [
+          'const { spawn } = require("node:child_process");',
+          'const fs = require("node:fs");',
+          'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+          "fs.writeFileSync(process.argv[1], String(child.pid));",
+          "setInterval(() => {}, 1000);"
+        ].join("\n"),
+        childPidFile
+      ],
+      { cwd: repo, detached: true, stdio: "ignore" }
+    );
+    parent.unref();
+
+    t.after(() => {
+      for (const pid of [-parent.pid, parent.pid, childPid]) {
+        try {
+          if (Number.isFinite(pid)) {
+            process.kill(pid, "SIGTERM");
+          }
+        } catch {
+          // Ignore missing cleanup processes.
+        }
+      }
+    });
+
+    childPid = await waitFor(() => {
+      if (!fs.existsSync(childPidFile)) {
+        return null;
+      }
+      return Number(fs.readFileSync(childPidFile, "utf8"));
+    });
+    const pidStartTime = await waitFor(() => getProcessStartTime(parent.pid));
+    saveBrokerSession(repo, {
+      pid: parent.pid,
+      pidStartTime
+    });
+
+    const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        cwd: repo
+      })
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    await waitFor(() => parent.exitCode !== null || parent.signalCode !== null);
+    assert.equal(parent.signalCode, "SIGTERM");
+  }
+);
+
+test("broker process log file is created private", { skip: process.platform === "win32" }, async () => {
+  const repo = makeTempDir();
+  const scriptPath = path.join(repo, "broker-exit.mjs");
+  const logFile = path.join(repo, "broker.log");
+  fs.writeFileSync(scriptPath, "process.exit(0);\n", "utf8");
+
+  const child = spawnBrokerProcess({
+    scriptPath,
+    cwd: repo,
+    endpoint: "unused",
+    pidFile: path.join(repo, "broker.pid"),
+    logFile
+  });
+
+  await waitFor(() => child.exitCode !== null || child.signalCode !== null);
+
+  const mode = fs.statSync(logFile).mode & 0o777;
+  assert.equal(mode, 0o600, `broker log should be 0600, got ${mode.toString(8)}`);
 });
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
@@ -1968,7 +2191,8 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
-  const status = run("node", [SCRIPT, "status"], {
+  // Stop-gate reviews are internal: hidden from the default view, visible with --all.
+  const status = run("node", [SCRIPT, "status", "--all"], {
     cwd: repo,
     env: {
       ...buildEnv(binDir),
@@ -1993,32 +2217,24 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   const runningLog = path.join(jobsDir, "task-running.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
 
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: {
+      stopReviewGate: false
+    },
+    jobs: [
       {
-        version: 1,
-        config: {
-          stopReviewGate: false
-        },
-        jobs: [
-          {
-            id: "task-live",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const blocked = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2394,14 +2610,14 @@ test("ask supports --json, --prompt-file, and --cwd", () => {
   const viaCwd = run("node", [SCRIPT, "ask", "--cwd", repo, "cwd question"], { cwd: otherCwd, env });
   assert.equal(viaCwd.status, 0, viaCwd.stderr);
   const stateDir = resolveStateDir(repo);
-  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const jobs = readStateFixture(stateDir).jobs;
   assert.equal(jobs[0].kind, "ask");
 });
 
 test("ask preflight failure leaves a failed tracked job that result renders generically", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  installNodeShim(binDir);
   const env = {
     ...process.env,
     PATH: binDir,
@@ -2413,7 +2629,7 @@ test("ask preflight failure leaves a failed tracked job that result renders gene
   assert.match(result.stderr, /Codex CLI is not installed/);
 
   const stateDir = resolveStateDir(repo);
-  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const state = readStateFixture(stateDir);
   const askJob = state.jobs.find((job) => job.jobClass === "ask");
   assert.equal(askJob.status, "failed");
 
@@ -2446,7 +2662,7 @@ test("ask stays out of task resume and default result selection", () => {
   assert.doesNotMatch(result.stdout, /Codex advisor thread:/);
 
   const stateDir = resolveStateDir(repo);
-  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const jobs = readStateFixture(stateDir).jobs;
   const askJob = jobs.find((job) => job.jobClass === "ask");
   const askResult = run("node", [SCRIPT, "result", askJob.id], { cwd: repo, env });
   assert.equal(askResult.status, 0, askResult.stderr);
@@ -2482,9 +2698,7 @@ test("status labels completed and running ask jobs as ask", () => {
   assert.equal(finishedReport.latestFinished.kindLabel, "ask");
 
   const stateDir = resolveStateDir(repo);
-  const statePath = path.join(stateDir, "state.json");
-  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  state.jobs.unshift({
+  writeJobFixture(stateDir, {
     id: "ask-live",
     status: "running",
     title: "Codex Advisor",
@@ -2493,7 +2707,6 @@ test("status labels completed and running ask jobs as ask", () => {
     summary: "Live advisor question",
     updatedAt: "2099-01-01T00:00:00.000Z"
   });
-  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 
   const running = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
   assert.equal(running.status, 0, running.stderr);
@@ -2526,30 +2739,22 @@ test("stop hook labels a running ask job as ask", () => {
   fs.mkdirSync(jobsDir, { recursive: true });
   const runningLog = path.join(jobsDir, "ask-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "ask-live",
-            status: "running",
-            title: "Codex Advisor",
-            jobClass: "ask",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "ask-live",
+        status: "running",
+        title: "Codex Advisor",
+        jobClass: "ask",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2571,34 +2776,22 @@ test("ask self-heals around interrupted ask jobs", () => {
   installFakeCodex(binDir);
   const env = askEnv(binDir, "sess-current");
   const stateDir = resolveStateDir(repo);
-  const statePath = path.join(stateDir, "state.json");
 
   // An ask killed before its thread was created leaves a running record without a
   // threadId — nothing to resume, so the next ask starts fresh.
-  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    statePath,
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "ask-stuck-no-thread",
-            status: "running",
-            title: "Codex Advisor",
-            jobClass: "ask",
-            sessionId: "sess-current",
-            summary: "Interrupted before thread creation",
-            updatedAt: "2099-01-01T00:00:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "ask-stuck-no-thread",
+        status: "running",
+        title: "Codex Advisor",
+        jobClass: "ask",
+        sessionId: "sess-current",
+        summary: "Interrupted before thread creation",
+        updatedAt: "2099-01-01T00:00:00.000Z"
+      }
+    ]
+  });
 
   const fresh = run("node", [SCRIPT, "ask", "no resumable thread yet"], { cwd: repo, env });
   assert.equal(fresh.status, 0, fresh.stderr);
@@ -2606,14 +2799,14 @@ test("ask self-heals around interrupted ask jobs", () => {
 
   // An ask killed AFTER thread creation leaves a running record with a threadId.
   // The next ask must resume that thread so the conversation context survives.
-  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const state = readStateFixture(stateDir);
   for (const job of state.jobs) {
     if (job.threadId === "thr_1") {
       job.status = "running";
       job.updatedAt = "2099-01-02T00:00:00.000Z";
+      writeJobFixture(stateDir, job);
     }
   }
-  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 
   const resumed = run("node", [SCRIPT, "ask", "continue after the interruption"], { cwd: repo, env });
   assert.equal(resumed.status, 0, resumed.stderr);
@@ -2651,7 +2844,10 @@ test("explicit --model skips the config lookup entirely", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "do the thing"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
 
   assert.equal(result.status, 0, result.stderr);
   const state = readFakeState(binDir);
@@ -2737,7 +2933,10 @@ test("task --resume-last keeps the null model on the resumed thread", () => {
   assert.equal(resumed.status, 0, resumed.stderr);
   assert.equal(readFakeState(binDir).lastTurnStart.model, null);
 
-  const explicitResume = run("node", [SCRIPT, "task", "--resume-last", "--model", "spark", "one more"], { cwd: repo, env });
+  const explicitResume = run("node", [SCRIPT, "task", "--resume-last", "--model", "spark", "one more"], {
+    cwd: repo,
+    env
+  });
   assert.equal(explicitResume.status, 0, explicitResume.stderr);
   assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.3-codex-spark");
 });
@@ -2765,7 +2964,7 @@ test("a failed ask turn renders loudly, keeps its thread, and stays resumable", 
   assert.match(failed.stdout, /Codex advisor thread: thr_1 \(new\)/);
 
   const stateDir = resolveStateDir(repo);
-  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const jobs = readStateFixture(stateDir).jobs;
   const askJob = jobs.find((job) => job.jobClass === "ask");
   assert.equal(askJob.status, "failed");
   assert.equal(askJob.threadId, "thr_1");
@@ -2810,30 +3009,22 @@ test("stop hook labels a running review job as review", () => {
   fs.mkdirSync(jobsDir, { recursive: true });
   const runningLog = path.join(jobsDir, "review-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "review-live",
-            status: "running",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "review-live",
+        status: "running",
+        title: "Codex Review",
+        jobClass: "review",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2855,31 +3046,23 @@ test("stop hook falls back to legacy job kind when jobClass is absent", () => {
   fs.mkdirSync(jobsDir, { recursive: true });
   const runningLog = path.join(jobsDir, "review-live.log");
   fs.writeFileSync(runningLog, "running\n", "utf8");
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "legacy-review-live",
-            kind: "review",
-            kindLabel: "task",
-            status: "running",
-            title: "Codex Review",
-            sessionId: "sess-current",
-            logFile: runningLog,
-            createdAt: "2026-03-18T15:32:00.000Z",
-            updatedAt: "2026-03-18T15:33:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "legacy-review-live",
+        kind: "review",
+        kindLabel: "task",
+        status: "running",
+        title: "Codex Review",
+        sessionId: "sess-current",
+        logFile: runningLog,
+        createdAt: "2026-03-18T15:32:00.000Z",
+        updatedAt: "2026-03-18T15:33:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [STOP_HOOK], {
     cwd: repo,
@@ -2898,29 +3081,21 @@ test("result without a job id reports a first-ever running ask as still running"
   const repo = makeTempDir();
   const stateDir = resolveStateDir(repo);
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
-  fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
+  seedStateFixture(stateDir, {
+    version: 1,
+    config: { stopReviewGate: false },
+    jobs: [
       {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "ask-live",
-            status: "running",
-            title: "Codex Advisor",
-            jobClass: "ask",
-            sessionId: "sess-current",
-            summary: "Live advisor question",
-            updatedAt: "2099-01-01T00:00:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
-    "utf8"
-  );
+        id: "ask-live",
+        status: "running",
+        title: "Codex Advisor",
+        jobClass: "ask",
+        sessionId: "sess-current",
+        summary: "Live advisor question",
+        updatedAt: "2099-01-01T00:00:00.000Z"
+      }
+    ]
+  });
 
   const result = run("node", [SCRIPT, "result"], {
     cwd: repo,

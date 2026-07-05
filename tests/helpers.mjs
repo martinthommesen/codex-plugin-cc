@@ -4,6 +4,17 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Hermetic tests: drop ambient plugin session vars (CODEX_COMPANION_*,
+// CLAUDE_PLUGIN_DATA) so the suite behaves identically inside a Claude Code
+// session (where the plugin exports them) and in clean CI. Stripping here — not
+// only in buildEnv — also keeps the test process's own resolveStateDir() in
+// sync with the CLI subprocesses it spawns (both then use the /tmp fallback).
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith("CODEX_COMPANION_") || key === "CLAUDE_PLUGIN_DATA") {
+    delete process.env[key];
+  }
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -21,6 +32,61 @@ export function run(command, args, options = {}) {
     shell: process.platform === "win32" && !path.isAbsolute(command),
     windowsHide: true
   });
+}
+
+// --- state fixtures (single per-job store) ---------------------------------
+// The plugin stores each job as <stateDir>/jobs/<id>.json and the review-gate
+// setting in <stateDir>/config.json. These helpers seed and read that layout,
+// mirroring listJobs() (scan + cancel-marker overlay + newest-first sort).
+
+export function seedStateFixture(stateDir, state = {}) {
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const config = state.config ?? { stopReviewGate: false };
+  fs.writeFileSync(path.join(stateDir, "config.json"), `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  for (const job of state.jobs ?? []) {
+    // Merge onto any record already written (the single store now holds fields
+    // the old model split between the index and the per-job file, e.g. result).
+    const jobFile = path.join(jobsDir, `${job.id}.json`);
+    let existing = {};
+    try {
+      existing = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    } catch {
+      existing = {};
+    }
+    fs.writeFileSync(jobFile, `${JSON.stringify({ ...existing, ...job }, null, 2)}\n`, "utf8");
+  }
+}
+
+export function writeJobFixture(stateDir, job) {
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, `${job.id}.json`), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+}
+
+export function readStateFixture(stateDir) {
+  const jobsDir = path.join(stateDir, "jobs");
+  let jobs = [];
+  try {
+    jobs = fs
+      .readdirSync(jobsDir)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => {
+        const job = JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8"));
+        const marker = path.join(jobsDir, `${name.slice(0, -".json".length)}.cancelled`);
+        return fs.existsSync(marker) ? { ...job, status: "cancelled" } : job;
+      })
+      .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  } catch {
+    jobs = [];
+  }
+  let config = { stopReviewGate: false };
+  try {
+    config = JSON.parse(fs.readFileSync(path.join(stateDir, "config.json"), "utf8"));
+  } catch {
+    /* default config */
+  }
+  return { version: 1, config, jobs };
 }
 
 export function initGitRepo(cwd) {

@@ -46,8 +46,7 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
           findings: [],
           next_steps: []
         },
-        rawOutput:
-          '{"verdict":"needs-attention","summary":"One issue.","findings":[],"next_steps":[]}'
+        rawOutput: '{"verdict":"needs-attention","summary":"One issue.","findings":[],"next_steps":[]}'
       }
     }
   );

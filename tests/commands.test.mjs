@@ -23,7 +23,10 @@ test("review command uses AskUserQuestion and background Bash while staying revi
   assert.match(source, /review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/);
+  assert.match(
+    source,
+    /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" review "\$ARGUMENTS"`/
+  );
   assert.match(source, /description:\s*"Codex review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -51,7 +54,10 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /adversarial-review "\$ARGUMENTS"/);
   assert.match(source, /\[--scope auto\|working-tree\|branch\] \[focus \.\.\.\]/);
   assert.match(source, /run_in_background:\s*true/);
-  assert.match(source, /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/);
+  assert.match(
+    source,
+    /command:\s*`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" adversarial-review "\$ARGUMENTS"`/
+  );
   assert.match(source, /description:\s*"Codex adversarial review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.match(source, /Return the command stdout verbatim, exactly as-is/i);
@@ -129,36 +135,66 @@ test("delegate command absorbs continue semantics", () => {
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /^description: .*[Pp]roactively/m);
   assert.match(agent, /agentType: 'codex:codex'/);
-  assert.match(agent, /StructuredOutput instruction \(as Workflow `agent\(\.\.\.\)` calls with a `schema` append\), include that instruction verbatim/i);
+  assert.match(
+    agent,
+    /StructuredOutput instruction \(as Workflow `agent\(\.\.\.\)` calls with a `schema` append\), include that instruction verbatim/i
+  );
   assert.match(agent, /prefer foreground for a small, clearly bounded task/i);
-  assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
+  assert.match(
+    agent,
+    /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i
+  );
   assert.match(agent, /Use exactly one `Bash` call/i);
-  assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
+  assert.match(
+    agent,
+    /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i
+  );
   assert.match(agent, /Do not call any companion subcommand other than `task`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
   assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
+  assert.match(
+    agent,
+    /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i
+  );
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return the command's error output verbatim/i);
   assert.match(agent, /codex-prompting/);
   assert.match(agent, /falling back to `gpt-5\.5` on fresh threads/i);
   assert.match(agent, /only to tighten the incoming request into a better Codex prompt/i);
-  assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
+  assert.match(
+    agent,
+    /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i
+  );
   assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
   assert.match(runtimeSkill, /Do not call any companion subcommand other than `task`/i);
-  assert.match(runtimeSkill, /use the `codex-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
+  assert.match(
+    runtimeSkill,
+    /use the `codex-prompting` skill to rewrite the user's request into a tighter Codex prompt/i
+  );
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
+  assert.match(
+    runtimeSkill,
+    /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i
+  );
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
-  assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
-  assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return the command's error output verbatim/i);
+  assert.match(
+    runtimeSkill,
+    /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i
+  );
+  assert.match(
+    runtimeSkill,
+    /If the Bash call fails or Codex cannot be invoked, return the command's error output verbatim/i
+  );
   assert.match(readme, /`codex:codex` subagent/i);
-  assert.match(readme, /if you do not pass `--model`, the plugin uses your Codex config's model; if neither sets one and your configured provider is OpenAI, it falls back to `gpt-5\.5` on fresh threads/i);
+  assert.match(
+    readme,
+    /if you do not pass `--model`, the plugin uses your Codex config's model; if neither sets one and your configured provider is OpenAI, it falls back to `gpt-5\.5` on fresh threads/i
+  );
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
@@ -190,7 +226,10 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(result, /codex-companion\.mjs" result "\$ARGUMENTS"/);
   assert.match(cancel, /disable-model-invocation:\s*true/);
   assert.match(cancel, /codex-companion\.mjs" cancel "\$ARGUMENTS"/);
-  assert.match(resultHandling, /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i);
+  assert.match(
+    resultHandling,
+    /do not turn a failed or incomplete Codex run into a Claude-side implementation attempt/i
+  );
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
 
@@ -257,10 +296,10 @@ test("setup command can offer Codex install and still points users to codex logi
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*"\[--enable-review-gate\|--disable-review-gate\]"/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
-  assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
+  assert.match(setup, /codex-companion\.mjs" setup --json "\$ARGUMENTS"/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);

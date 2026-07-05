@@ -65,12 +65,20 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
   return totalBytes;
 }
 
+// Resolve a repo/user-supplied ref to a commit SHA. `--end-of-options` guarantees
+// the ref is never parsed as a git option (blocks option-injection like a branch
+// named `--upload-pack=...`), and `^{commit}` + `--verify` reject anything that
+// isn't a real commit. Everything downstream then operates on the hex SHA.
+function resolveRefToCommit(cwd, ref) {
+  return gitChecked(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`]).stdout.trim();
+}
+
 function buildBranchComparison(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+  const baseCommit = resolveRefToCommit(cwd, baseRef);
+  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseCommit]).stdout.trim();
   return {
     mergeBase,
-    commitRange: `${mergeBase}..HEAD`,
-    reviewRange: `${baseRef}...HEAD`
+    commitRange: `${mergeBase}..HEAD`
   };
 }
 
@@ -121,7 +129,10 @@ export function getCurrentBranch(cwd) {
 export function getWorkingTreeState(cwd) {
   const staged = gitChecked(cwd, ["diff", "--cached", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
   const unstaged = gitChecked(cwd, ["diff", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const untracked = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard"]).stdout.trim().split("\n").filter(Boolean);
+  const untracked = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard"])
+    .stdout.trim()
+    .split("\n")
+    .filter(Boolean);
 
   return {
     staged,
@@ -262,7 +273,10 @@ function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
-  const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
+  const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange])
+    .stdout.trim()
+    .split("\n")
+    .filter(Boolean);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
 
@@ -322,7 +336,10 @@ export function collectReviewContext(cwd, target, options = {}) {
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
-    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
+    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange])
+      .stdout.trim()
+      .split("\n")
+      .filter(Boolean).length;
     diffBytes = measureGitOutputBytes(
       repoRoot,
       ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],

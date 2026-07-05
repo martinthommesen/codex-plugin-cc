@@ -112,6 +112,7 @@ Review this diff, fix the bug you find, update the docs, and suggest a roadmap.
 ```
 
 Better:
+
 - Run review first.
 - Run a separate fix prompt if needed.
 - Use a third run for docs or roadmap work.

@@ -473,6 +473,25 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "turn-errors-with-stderr") {
+	          process.stderr.write("broker stderr head marker\\n" + "x".repeat(4200) + "\\nbroker stderr tail marker\\n");
+	          throw new Error("turn/start failed with stderr");
+	        }
+	        if (BEHAVIOR === "interruptible-delayed-turn-start") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          const timer = setTimeout(() => {
+	            if (!interruptibleTurns.has(turnId)) {
+	              return;
+	            }
+	            interruptibleTurns.delete(turnId);
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 5000);
+	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
+	          setTimeout(() => {
+	            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	          }, 200);
+	          break;
+	        }
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         if (BEHAVIOR === "turn-fails" || prompt.includes("FAIL_THIS_TURN")) {
@@ -682,4 +701,15 @@ export function buildEnv(binDir) {
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
+}
+
+export function buildHomeEnv(home) {
+  return {
+    HOME: home,
+    USERPROFILE: home
+  };
+}
+
+export function installNodeShim(binDir) {
+  fs.symlinkSync(process.execPath, path.join(binDir, process.platform === "win32" ? "node.exe" : "node"));
 }
