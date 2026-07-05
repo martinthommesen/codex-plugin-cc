@@ -37,7 +37,10 @@ A Role line is optional; skip Personality blocks entirely for one-shot task prom
 
 ## Structured output
 
-Schemas go through the runtime's `outputSchema` plumbing, never pasted into prompt text. Describing the shape in prose AND attaching a schema is redundant — attach the schema and keep the prompt about the goal.
+State the answer's shape in the prompt's Output section. Two special cases:
+
+- The plugin's review commands attach their JSON schema through the runtime's `outputSchema` plumbing internally — do not duplicate that schema in review prompt text.
+- When a Workflow `agent(...)` call appends a StructuredOutput or output-format instruction to a delegated task, that instruction IS the output contract: forward it verbatim in the task text. It is the mechanism, not an anti-pattern.
 
 ## Verification
 

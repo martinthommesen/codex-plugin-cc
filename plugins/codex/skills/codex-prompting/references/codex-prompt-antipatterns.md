@@ -53,15 +53,17 @@ Goal, success criteria, output, stop rules — a few lines of prose.
 
 Block catalogs built for weaker models add noise; 5.5 reads short outcome-first prompts more reliably.
 
-## Output schemas in prompt text
+## Duplicating runtime-attached schemas in prompt text
 
 Bad:
 
 ```text
-Reply with JSON: {"verdict": ..., "findings": [{"severity": ..., ...}]}
+Reply with JSON: {"verdict": ..., "findings": [{"severity": ..., ...}]}   (pasted into a review prompt)
 ```
 
-Better: attach the schema through the runtime's `outputSchema` plumbing and keep the prompt about the goal.
+Better: the plugin's review commands already attach that schema through the runtime's `outputSchema` plumbing — keep the review prompt about the goal.
+
+This anti-pattern is ONLY about duplicating a schema the runtime already enforces. A StructuredOutput instruction appended by a Workflow `agent(...)` call is the output contract for that task — forward it verbatim, never strip it.
 
 ## Vague stopping conditions
 

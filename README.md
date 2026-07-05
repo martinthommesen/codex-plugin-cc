@@ -139,7 +139,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest task thread for this repo.
+It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest task thread from your current Claude session in this repo.
 
 Examples:
 
@@ -160,7 +160,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model`, the plugin uses your Codex config's model; if neither sets one, it falls back to `gpt-5.5` on fresh threads. Effort still follows the Codex config or default.
+- if you do not pass `--model`, the plugin uses your Codex config's model; if neither sets one and your configured provider is OpenAI, it falls back to `gpt-5.5` on fresh threads (if the config can't be read, model selection is left to Codex). Effort still follows the Codex config or default.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up delegated requests can continue the latest Codex task in the repo
 
@@ -214,6 +214,7 @@ Use it to:
 
 Shows the final stored Codex output for a finished job.
 When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
+Without a job id it shows the latest finished task or review — advisor asks are skipped because their answers were already shown inline; pass the ask job id to replay one.
 
 Examples:
 
@@ -293,7 +294,7 @@ model = "gpt-5.4-mini"
 model_reasoning_effort = "high"
 ```
 
-When `model` is absent from every config layer (and you pass no `--model`), the plugin falls back to `gpt-5.5` on fresh threads.
+When `model` is absent from every config layer (and you pass no `--model`) with an OpenAI provider, the plugin falls back to `gpt-5.5` on fresh threads. Non-OpenAI `model_provider` configurations are never overridden.
 
 Your configuration will be picked up based on:
 

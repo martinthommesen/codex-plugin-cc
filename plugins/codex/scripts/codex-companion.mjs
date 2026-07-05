@@ -83,7 +83,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
-      "  node scripts/codex-companion.mjs ask [--fresh] [-m|--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [question]   (read-only; resume is automatic, --resume/--resume-last are not accepted)",
+      "  node scripts/codex-companion.mjs ask [--fresh] [-m|--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [question]   (read-only, foreground-only; resume is automatic — --background, --wait, --write, --resume, and --resume-last are rejected)",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -364,18 +364,20 @@ async function resolveAdvisorThread(cwd, options = {}) {
   const jobs = filterJobsForCurrentClaudeSession(
     sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId)
   );
-  const trackedAsk = jobs.find(
-    (job) => job.jobClass === "ask" && job.threadId && job.status !== "queued" && job.status !== "running"
-  );
+  // Any ask job with a threadId counts, including stuck "running" records: a killed
+  // foreground ask already created its thread, so resuming preserves the conversation;
+  // if the process is genuinely still live, the busy-thread turn error is loud.
+  const trackedAsk = jobs.find((job) => job.jobClass === "ask" && job.threadId);
   if (trackedAsk) {
-    return { id: trackedAsk.threadId };
+    return { id: trackedAsk.threadId, matchedByName: false };
   }
 
   if (getCurrentClaudeSessionId()) {
     return null;
   }
 
-  return findLatestThreadByPrefix(workspaceRoot, ADVISOR_THREAD_PREFIX);
+  const namedThread = await findLatestThreadByPrefix(workspaceRoot, ADVISOR_THREAD_PREFIX);
+  return namedThread ? { id: namedThread.id, matchedByName: true } : null;
 }
 
 async function executeReviewRun(request) {
@@ -434,6 +436,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
+    configModelKeys: ["model", "review_model"],
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -557,11 +560,13 @@ async function executeAskRun(request) {
   ensureCodexAvailable(request.cwd);
 
   let resumeThreadId = null;
+  let resumeMatchedByName = false;
   if (!request.fresh) {
     const latestThread = await resolveAdvisorThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
     resumeThreadId = latestThread?.id ?? null;
+    resumeMatchedByName = Boolean(latestThread?.matchedByName);
   }
 
   const result = await runAppServerTurn(workspaceRoot, {
@@ -583,6 +588,7 @@ async function executeAskRun(request) {
     threadId: result.threadId,
     turnId: result.turnId,
     resumed: Boolean(resumeThreadId),
+    resumeMatchedByName,
     rawOutput,
     reasoningSummary: result.reasoningSummary,
     failureMessage

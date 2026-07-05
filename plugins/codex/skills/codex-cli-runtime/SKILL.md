@@ -18,7 +18,7 @@ Primary helper:
 Execution rules:
 - The subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
 - Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, `cancel`, or `ask` from `codex:codex`.
+- Do not call any companion subcommand other than `task` from `codex:codex` — no `setup`, `review`, `adversarial-review`, `status`, `result`, `cancel`, `transfer`, or `ask`.
 - Use `task` for every delegated request, including diagnosis, planning, research, and explicit fix requests.
 - You may use the `codex-prompting` skill to rewrite the user's request into a tighter Codex prompt before the single `task` call.
 - That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
@@ -44,7 +44,7 @@ Safety rules:
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+- If the Bash call fails or Codex cannot be invoked, return the command's error output verbatim; do not substitute your own answer.
 
 ## ask (from the main Claude loop)
 
@@ -57,5 +57,5 @@ Contract:
 - Resume is automatic: each `ask` continues this Claude session's advisor thread, so follow-ups only need the new question or delta — do not re-send context Codex already has.
 - `--fresh` starts a new advisor thread. Use it for an unrelated topic, and always in parallel or workflow contexts (concurrent asks on the shared thread make the second turn fail on a busy thread).
 - `-m`/`--model <model|spark>` and `--effort <none|minimal|low|medium|high|xhigh>` work as on `task`; `spark` maps to `gpt-5.3-codex-spark`. Leave both unset by default.
-- The output ends with a `Codex advisor thread: <id> (continued|new)` line; keep it visible so the user can continue the conversation.
+- The output ends with a `Codex advisor thread: <id> (continued|new)` line; keep it visible so the user can continue the conversation. A `continued, matched by thread name` label means the thread was recovered by name search rather than tracked job state — prior context may be older than expected.
 - Auto-resume is best-effort within tracked job state: job pruning or session end silently starts a fresh advisor thread.

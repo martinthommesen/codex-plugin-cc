@@ -272,11 +272,9 @@ export function resolveResultJob(cwd, reference) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(
-    jobs,
-    reference,
-    excludeAsk((job) => job.status === "queued" || job.status === "running")
-  );
+  // The active check stays ask-inclusive so a first-ever running ask still yields a
+  // truthful "still running" message instead of "no finished jobs".
+  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
   }

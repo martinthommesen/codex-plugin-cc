@@ -325,9 +325,18 @@ export function renderTaskResult(parsedResult, meta) {
 export function renderAskResult(payload) {
   const rawOutput = typeof payload?.rawOutput === "string" ? payload.rawOutput : "";
   const answer = rawOutput.trimEnd() || String(payload?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  const lines = [answer];
+  const lines = [];
+  if (typeof payload?.status === "number" && payload.status !== 0) {
+    lines.push("Codex advisor turn failed.", "");
+  }
+  lines.push(answer);
   if (payload?.threadId) {
-    lines.push("", `Codex advisor thread: ${payload.threadId} (${payload.resumed ? "continued" : "new"})`);
+    const resumeLabel = payload.resumed
+      ? payload.resumeMatchedByName
+        ? "continued, matched by thread name"
+        : "continued"
+      : "new";
+    lines.push("", `Codex advisor thread: ${payload.threadId} (${resumeLabel})`);
   }
   return `${lines.join("\n")}\n`;
 }

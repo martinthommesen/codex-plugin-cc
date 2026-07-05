@@ -888,7 +888,7 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 // Fallback to DEFAULT_MODEL only when nobody chose: explicit --model wins without an RPC,
 // a Codex-config model (or any non-openai provider) wins by passing null so Codex-side
 // config layering stays authoritative.
-async function resolveEffectiveModel(client, cwd, requestedModel, { configModelKeys = ["model"] } = {}) {
+async function resolveEffectiveModel(client, cwd, requestedModel, { configModelKeys = ["model"], onProgress = null } = {}) {
   if (requestedModel != null) {
     return requestedModel;
   }
@@ -901,7 +901,9 @@ async function resolveEffectiveModel(client, cwd, requestedModel, { configModelK
     }
     const configured = configModelKeys.some((key) => typeof config[key] === "string" && config[key].trim());
     return configured ? null : DEFAULT_MODEL;
-  } catch {
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    emitProgress(onProgress, `Codex config lookup failed (${detail}); leaving model selection to Codex.`, "starting");
     return null;
   }
 }
@@ -1030,7 +1032,8 @@ export async function runAppServerReview(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     const model = await resolveEffectiveModel(client, cwd, options.model ?? null, {
-      configModelKeys: ["model", "review_model"]
+      configModelKeys: ["model", "review_model"],
+      onProgress: options.onProgress
     });
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
@@ -1129,7 +1132,10 @@ export async function runAppServerTurn(cwd, options = {}) {
     // request and never inject the fallback.
     const model = options.resumeThreadId
       ? options.model ?? null
-      : await resolveEffectiveModel(client, cwd, options.model ?? null);
+      : await resolveEffectiveModel(client, cwd, options.model ?? null, {
+          configModelKeys: options.configModelKeys ?? ["model"],
+          onProgress: options.onProgress
+        });
     let threadId;
 
     if (options.resumeThreadId) {

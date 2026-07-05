@@ -100,6 +100,11 @@ function buildConfigReadResult() {
         config: { model_provider: "openai", review_model: "gpt-5.4-mini" },
         origins: {}
       };
+    case "config-with-blank-model":
+      return {
+        config: { model_provider: "openai", model: "   " },
+        origins: {}
+      };
     case "env-key-provider":
       return {
         config: {
@@ -469,6 +474,12 @@ rl.on("line", (line) => {
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+        if (BEHAVIOR === "turn-fails" || prompt.includes("FAIL_THIS_TURN")) {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
+          break;
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

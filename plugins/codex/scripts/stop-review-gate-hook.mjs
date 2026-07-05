@@ -147,7 +147,8 @@ function main() {
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
-  // Label from jobClass, not the stored kindLabel, so old persisted records can't leak stale names.
+  // Label from jobClass, not the stored kindLabel: kindLabel is snapshotted at job creation,
+  // so it can carry whatever naming was current when the record was written.
   const runningJobLabel = runningJob ? (runningJob.jobClass === "ask" ? "ask" : runningJob.jobClass === "review" ? "review" : "task") : null;
   const runningTaskNote = runningJob
     ? `Codex ${runningJobLabel} ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
