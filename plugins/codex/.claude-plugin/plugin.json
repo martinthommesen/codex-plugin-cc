@@ -1,7 +1,7 @@
 {
   "name": "codex",
-  "version": "1.0.5",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "version": "2.1.0",
+  "description": "Use Codex from Claude Code to review code, delegate tasks, or ask for advice.",
   "author": {
     "name": "OpenAI"
   }

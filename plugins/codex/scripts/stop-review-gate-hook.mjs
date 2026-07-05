@@ -147,8 +147,10 @@ function main() {
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
+  // Label from jobClass, not the stored kindLabel, so old persisted records can't leak stale names.
+  const runningJobLabel = runningJob ? (runningJob.jobClass === "ask" ? "ask" : runningJob.jobClass === "review" ? "review" : "task") : null;
   const runningTaskNote = runningJob
-    ? `Codex task ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
+    ? `Codex ${runningJobLabel} ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;
 
   if (!config.stopReviewGate) {

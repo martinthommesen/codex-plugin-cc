@@ -8,9 +8,10 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
-    buildPersistentTaskThreadName,
+    ADVISOR_THREAD_PREFIX,
+    buildPersistentThreadName,
     DEFAULT_CONTINUE_PROMPT,
-    findLatestTaskThread,
+    findLatestThreadByPrefix,
     getCodexAuthStatus,
     getCodexAvailability,
     getSessionRuntimeStatus,
@@ -19,7 +20,8 @@ import {
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
-    runAppServerTurn
+    runAppServerTurn,
+    TASK_THREAD_PREFIX
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -54,6 +56,7 @@ import {
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  renderAskResult,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -80,6 +83,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs ask [--fresh] [-m|--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [question]   (read-only; resume is automatic, --resume/--resume-last are not accepted)",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -352,7 +356,26 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
     return null;
   }
 
-  return findLatestTaskThread(workspaceRoot);
+  return findLatestThreadByPrefix(workspaceRoot, TASK_THREAD_PREFIX);
+}
+
+async function resolveAdvisorThread(cwd, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = filterJobsForCurrentClaudeSession(
+    sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId)
+  );
+  const trackedAsk = jobs.find(
+    (job) => job.jobClass === "ask" && job.threadId && job.status !== "queued" && job.status !== "running"
+  );
+  if (trackedAsk) {
+    return { id: trackedAsk.threadId };
+  }
+
+  if (getCurrentClaudeSessionId()) {
+    return null;
+  }
+
+  return findLatestThreadByPrefix(workspaceRoot, ADVISOR_THREAD_PREFIX);
 }
 
 async function executeReviewRun(request) {
@@ -491,7 +514,7 @@ async function executeTaskRun(request) {
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    threadName: resumeThreadId ? null : buildPersistentThreadName(TASK_THREAD_PREFIX, request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -529,6 +552,54 @@ async function executeTaskRun(request) {
   };
 }
 
+async function executeAskRun(request) {
+  const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  ensureCodexAvailable(request.cwd);
+
+  let resumeThreadId = null;
+  if (!request.fresh) {
+    const latestThread = await resolveAdvisorThread(workspaceRoot, {
+      excludeJobId: request.jobId
+    });
+    resumeThreadId = latestThread?.id ?? null;
+  }
+
+  const result = await runAppServerTurn(workspaceRoot, {
+    resumeThreadId,
+    prompt: request.prompt,
+    model: request.model,
+    effort: request.effort,
+    sandbox: "read-only",
+    onProgress: request.onProgress,
+    persistThread: true,
+    threadKindLabel: "advisor",
+    threadName: resumeThreadId ? null : buildPersistentThreadName(ADVISOR_THREAD_PREFIX, request.prompt)
+  });
+
+  const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
+  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const payload = {
+    status: result.status,
+    threadId: result.threadId,
+    turnId: result.turnId,
+    resumed: Boolean(resumeThreadId),
+    rawOutput,
+    reasoningSummary: result.reasoningSummary,
+    failureMessage
+  };
+
+  return {
+    exitStatus: result.status,
+    threadId: result.threadId,
+    turnId: result.turnId,
+    payload,
+    rendered: renderAskResult(payload),
+    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, "Codex Advisor finished.")),
+    jobTitle: "Codex Advisor",
+    jobClass: "ask"
+  };
+}
+
 function buildReviewJobMetadata(reviewName, target) {
   return {
     kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
@@ -561,7 +632,10 @@ function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
   }
-  return jobClass === "review" ? "review" : "rescue";
+  if (jobClass === "review") {
+    return "review";
+  }
+  return jobClass === "ask" ? "ask" : "task";
 }
 
 function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
@@ -822,6 +896,55 @@ async function handleTask(argv) {
   );
 }
 
+async function handleAsk(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    booleanOptions: ["json", "fresh", "background", "wait", "write", "resume", "resume-last"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  const rejectedFlag = ["background", "wait", "write", "resume", "resume-last"].find((flag) => options[flag]);
+  if (rejectedFlag) {
+    throw new Error(
+      `\`ask\` does not accept --${rejectedFlag}. Asks run in the foreground, read-only, and resume the session's advisor thread automatically; use --fresh to start a new one.`
+    );
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const prompt = readTaskPrompt(cwd, options, positionals);
+  if (!prompt) {
+    throw new Error("Provide a question, a prompt file, or piped stdin.");
+  }
+
+  const job = createCompanionJob({
+    prefix: "ask",
+    kind: "ask",
+    title: "Codex Advisor",
+    workspaceRoot,
+    jobClass: "ask",
+    summary: shorten(prompt)
+  });
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeAskRun({
+        cwd,
+        model,
+        effort,
+        prompt,
+        fresh: Boolean(options.fresh),
+        jobId: job.id,
+        onProgress: progress
+      }),
+    { json: options.json }
+  );
+}
+
 async function handleTransfer(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "source"],
@@ -1042,6 +1165,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "ask":
+      await handleAsk(argv);
       break;
     case "transfer":
       await handleTransfer(argv);

@@ -90,6 +90,16 @@ function buildConfigReadResult() {
         config: { model_provider: "ollama" },
         origins: {}
       };
+    case "config-with-model":
+      return {
+        config: { model_provider: "openai", model: "gpt-5.4-mini" },
+        origins: {}
+      };
+    case "config-with-review-model":
+      return {
+        config: { model_provider: "openai", review_model: "gpt-5.4-mini" },
+        origins: {}
+      };
     case "env-key-provider":
       return {
         config: {
@@ -116,13 +126,14 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
-function nextThread(state, cwd, ephemeral) {
+function nextThread(state, cwd, ephemeral, sandbox) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
     cwd: cwd || process.cwd(),
     name: null,
     preview: "",
     ephemeral: Boolean(ephemeral),
+    sandbox: sandbox ?? null,
     createdAt: now(),
     updatedAt: now()
   };
@@ -299,6 +310,8 @@ rl.on("line", (line) => {
         break;
 
       case "config/read":
+        state.configReadCount = (state.configReadCount || 0) + 1;
+        saveState(state);
         if (BEHAVIOR === "config-read-fails") {
           throw new Error("config/read failed for cwd");
         }
@@ -312,8 +325,10 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
-        const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        const thread = nextThread(state, message.params.cwd, message.params.ephemeral, message.params.sandbox);
+        state.lastThreadStart = { model: message.params.model ?? null };
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.5", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +361,9 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.resumeRequests = [...(state.resumeRequests || []), { threadId: message.params.threadId, sandbox: message.params.sandbox ?? null }];
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.5", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
       }
 
