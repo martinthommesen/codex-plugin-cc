@@ -162,7 +162,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model`, the plugin uses your Codex config's model; if neither sets one and your configured provider is OpenAI, it falls back to `gpt-5.5` on fresh threads (if the config can't be read, model selection is left to Codex). Effort still follows the Codex config or default.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- follow-up delegated requests can continue the latest Codex task in the repo
+- follow-up delegated requests can continue the latest Codex task from your current Claude session
 
 ### Ask Codex for advice
 
