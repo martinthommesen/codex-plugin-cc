@@ -10,7 +10,11 @@ import { buildEnv, buildHomeEnv, installFakeCodex, installNodeShim } from "./fak
 import { initGitRepo, makeTempDir, readStateFixture, run, seedStateFixture, writeJobFixture } from "./helpers.mjs";
 import { createBrokerSocketHandler } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { BrokerCodexAppServerClient, CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import {
+  loadBrokerSession,
+  saveBrokerSession,
+  spawnBrokerProcess
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { getProcessStartTime } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -2117,16 +2121,33 @@ test(
     });
     assert.equal(result.status, 0, result.stderr);
 
-    await waitFor(() => {
-      try {
-        process.kill(childPid, 0);
-        return false;
-      } catch (error) {
-        return error?.code === "ESRCH";
-      }
-    });
+    await waitFor(() => parent.exitCode !== null || parent.signalCode !== null);
+    assert.equal(parent.signalCode, "SIGTERM");
   }
 );
+
+test("broker process log file is created private", { skip: process.platform === "win32" }, async () => {
+  const repo = makeTempDir();
+  const scriptPath = path.join(repo, "broker-exit.mjs");
+  const logFile = path.join(repo, "broker.log");
+  fs.writeFileSync(scriptPath, "process.exit(0);\n", "utf8");
+
+  const child = spawnBrokerProcess({
+    scriptPath,
+    cwd: repo,
+    endpoint: "unused",
+    pidFile: path.join(repo, "broker.pid"),
+    logFile
+  });
+
+  await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("exit", resolve);
+  });
+
+  const mode = fs.statSync(logFile).mode & 0o777;
+  assert.equal(mode, 0o600, `broker log should be 0600, got ${mode.toString(8)}`);
+});
 
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();

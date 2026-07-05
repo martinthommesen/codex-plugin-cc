@@ -64,6 +64,36 @@ test("state directory and job files are created private (POSIX 0700/0600)", { sk
   assert.equal(fileMode & 0o077, 0, `job file must not be group/other accessible, got ${fileMode.toString(8)}`);
 });
 
+test("state directory creation tightens existing directory permissions", { skip: !isPosix }, () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+
+  try {
+    const stateDir = resolveStateDir(workspace);
+    const stateRoot = path.dirname(stateDir);
+    const jobsDir = path.join(stateDir, "jobs");
+    fs.mkdirSync(jobsDir, { recursive: true });
+    for (const dir of [stateRoot, stateDir, jobsDir]) {
+      fs.chmodSync(dir, 0o777);
+    }
+
+    ensureStateDir(workspace);
+
+    for (const dir of [stateRoot, stateDir, jobsDir]) {
+      const mode = fs.statSync(dir).mode & 0o777;
+      assert.equal(mode, 0o700, `${dir} mode should be tightened to 0700, got ${mode.toString(8)}`);
+    }
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
 test("writeFileAtomic never leaves a torn file and overwrites atomically", () => {
   const dir = makeTempDir();
   const target = path.join(dir, "atomic.json");
@@ -232,4 +262,33 @@ test("sweepJobs reaps a crashed active job but preserves a live one", () => {
   writeJobFile(live, "job-live", { status: "running", pid: 424242, updatedAt: "2026-01-01T00:00:00.000Z" });
   sweepJobs(live, { isJobAlive: () => true });
   assert.equal(listJobs(live)[0].status, "running");
+});
+
+test("sweepJobs verifies stored pid identity before preserving active jobs", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-live", {
+    status: "running",
+    pid: 4242,
+    pidStartTime: "start-a",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  writeJobFile(workspace, "job-recycled", {
+    status: "running",
+    pid: 4243,
+    pidStartTime: "start-b",
+    updatedAt: "2026-01-01T00:01:00.000Z"
+  });
+
+  sweepJobs(workspace, {
+    isProcessAlive: () => true,
+    getProcessStartTime(pid) {
+      return pid === 4242 ? "start-a" : "start-c";
+    }
+  });
+
+  const jobs = Object.fromEntries(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobs["job-live"].status, "running");
+  assert.equal(jobs["job-recycled"].status, "failed");
+  assert.equal(jobs["job-recycled"].pid, null);
+  assert.equal(jobs["job-recycled"].pidStartTime, null);
 });

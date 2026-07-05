@@ -60,20 +60,26 @@ export async function sendBrokerShutdown(endpoint) {
 }
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
-  const logFd = fs.openSync(logFile, "a");
-  const child = spawn(
-    process.execPath,
-    [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile],
-    {
-      cwd,
-      env,
-      detached: true,
-      stdio: ["ignore", logFd, logFd]
+  const logFd = fs.openSync(logFile, "a", 0o600);
+  try {
+    if (process.platform !== "win32") {
+      fs.fchmodSync(logFd, 0o600);
     }
-  );
-  child.unref();
-  fs.closeSync(logFd);
-  return child;
+    const child = spawn(
+      process.execPath,
+      [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile],
+      {
+        cwd,
+        env,
+        detached: true,
+        stdio: ["ignore", logFd, logFd]
+      }
+    );
+    child.unref();
+    return child;
+  } finally {
+    fs.closeSync(logFd);
+  }
 }
 
 function resolveBrokerStateFile(cwd) {

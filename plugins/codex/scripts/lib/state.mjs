@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { getProcessStartTime } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { PLUGIN_DATA_ENV } from "./constants.mjs";
 
@@ -134,6 +135,9 @@ function ensureSecureDir(dir) {
     if (process.platform !== "win32" && USER_SCOPE.uid != null && info.uid !== USER_SCOPE.uid) {
       throw new Error(`Refusing to use a state directory owned by another user: ${dir}`);
     }
+    if (process.platform !== "win32") {
+      fs.chmodSync(dir, 0o700);
+    }
     return;
   }
   fs.mkdirSync(dir, { mode: 0o700 });
@@ -156,6 +160,13 @@ export function ensureStateDir(cwd) {
 }
 
 // --- atomic write ----------------------------------------------------------
+
+const sleepBuffer = new SharedArrayBuffer(4);
+const sleepView = new Int32Array(sleepBuffer);
+
+function sleepSync(ms) {
+  Atomics.wait(sleepView, 0, 0, ms);
+}
 
 /**
  * Write `data` to `file` atomically and privately: a same-directory temp file
@@ -181,7 +192,7 @@ export function writeFileAtomic(file, data, mode = 0o600) {
       throw error;
     }
     try {
-      fs.writeSync(fd, data);
+      fs.writeFileSync(fd, data, "utf8");
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
@@ -197,6 +208,7 @@ export function writeFileAtomic(file, data, mode = 0o600) {
       const errorCode = /** @type {NodeJS.ErrnoException} */ (error).code;
       const transient = errorCode === "EPERM" || errorCode === "EBUSY" || errorCode === "EACCES";
       if (transient && attempt < 20) {
+        sleepSync(Math.min(100, 5 * (attempt + 1)));
         continue;
       }
       try {
@@ -501,11 +513,23 @@ function isStaleQueuedWithoutPid(job) {
  * MAX_TERMINAL_JOBS terminal ones. Reaps active records whose process is gone
  * (crash) so they stop masquerading as running. Called at job-creation cadence.
  *
- * `isJobAlive` is injectable — Group A checks pid liveness only; the process
- * identity check (pid + start-time) is layered in by callers in Group B.
+ * `isJobAlive` is injectable for tests; production checks pid liveness and,
+ * when recorded, the pid start-time so recycled pids are not treated as ours.
  */
 export function sweepJobs(cwd, options = {}) {
-  const isJobAlive = options.isJobAlive ?? ((job) => job.pid != null && isPidAlive(job.pid));
+  const isProcessAlive = options.isProcessAlive ?? isPidAlive;
+  const getProcessStartTimeImpl = options.getProcessStartTime ?? getProcessStartTime;
+  const isJobAlive =
+    options.isJobAlive ??
+    ((job) => {
+      if (job.pid == null || !isProcessAlive(job.pid)) {
+        return false;
+      }
+      if (job.pidStartTime == null) {
+        return true;
+      }
+      return getProcessStartTimeImpl(job.pid) === job.pidStartTime;
+    });
 
   for (const job of listJobs(cwd)) {
     const active = job.status === "queued" || job.status === "running";
