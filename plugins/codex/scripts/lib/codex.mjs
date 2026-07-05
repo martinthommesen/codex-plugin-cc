@@ -45,7 +45,9 @@ import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
+const DEFAULT_MODEL = "gpt-5.5";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
+const ADVISOR_THREAD_PREFIX = "Codex Companion Advisor";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
@@ -104,9 +106,9 @@ function looksLikeVerificationCommand(command) {
   );
 }
 
-function buildTaskThreadName(prompt) {
+function buildThreadName(prefix, prompt) {
   const excerpt = shorten(prompt, 56);
-  return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
+  return excerpt ? `${prefix}: ${excerpt}` : prefix;
 }
 
 function extractThreadId(message) {
@@ -883,6 +885,29 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+// Fallback to DEFAULT_MODEL only when nobody chose: explicit --model wins without an RPC,
+// a Codex-config model (or any non-openai provider) wins by passing null so Codex-side
+// config layering stays authoritative.
+async function resolveEffectiveModel(client, cwd, requestedModel, { configModelKeys = ["model"], onProgress = null } = {}) {
+  if (requestedModel != null) {
+    return requestedModel;
+  }
+  try {
+    const response = await client.request("config/read", { includeLayers: false, cwd });
+    const config = response?.config ?? {};
+    const provider = typeof config.model_provider === "string" ? config.model_provider.trim() : "";
+    if (provider && provider !== "openai") {
+      return null;
+    }
+    const configured = configModelKeys.some((key) => typeof config[key] === "string" && config[key].trim());
+    return configured ? null : DEFAULT_MODEL;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    emitProgress(onProgress, `Codex config lookup failed (${detail}); leaving model selection to Codex.`, "starting");
+    return null;
+  }
+}
+
 export function getCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
@@ -917,7 +942,7 @@ export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) 
   return {
     mode: "direct",
     label: "direct startup",
-    detail: "No shared Codex runtime is active yet. The first review or task command will start one on demand.",
+    detail: "No shared Codex runtime is active yet. The first review, task, or ask command will start one on demand.",
     endpoint: null
   };
 }
@@ -1006,9 +1031,13 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    const model = await resolveEffectiveModel(client, cwd, options.model ?? null, {
+      configModelKeys: ["model", "review_model"],
+      onProgress: options.onProgress
+    });
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
-      model: options.model,
+      model,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName
@@ -1099,20 +1128,28 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    // Resumed threads keep their creation-time model choice: pass through only an explicit
+    // request and never inject the fallback.
+    const model = options.resumeThreadId
+      ? options.model ?? null
+      : await resolveEffectiveModel(client, cwd, options.model ?? null, {
+          configModelKeys: options.configModelKeys ?? ["model"],
+          onProgress: options.onProgress
+        });
     let threadId;
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
+        model,
         sandbox: options.sandbox,
         ephemeral: false
       });
       threadId = response.thread.id;
     } else {
-      emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
+      emitProgress(options.onProgress, `Starting Codex ${options.threadKindLabel ?? "task"} thread.`, "starting");
       const response = await startThread(client, cwd, {
-        model: options.model,
+        model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
@@ -1136,7 +1173,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         client.request("turn/start", {
           threadId,
           input: buildTurnInput(prompt),
-          model: options.model ?? null,
+          model,
           effort: options.effort ?? null,
           outputSchema: options.outputSchema ?? null
         }),
@@ -1159,7 +1196,7 @@ export async function runAppServerTurn(cwd, options = {}) {
   });
 }
 
-export async function findLatestTaskThread(cwd) {
+export async function findLatestThreadByPrefix(cwd, prefix) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
@@ -1171,18 +1208,18 @@ export async function findLatestTaskThread(cwd) {
       limit: 20,
       sortKey: "updated_at",
       sourceKinds: ["appServer"],
-      searchTerm: TASK_THREAD_PREFIX
+      searchTerm: prefix
     });
 
     return (
-      response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(TASK_THREAD_PREFIX)) ??
+      response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(prefix)) ??
       null
     );
   });
 }
 
-export function buildPersistentTaskThreadName(prompt) {
-  return buildTaskThreadName(prompt);
+export function buildPersistentThreadName(prefix, prompt) {
+  return buildThreadName(prefix, prompt);
 }
 
 export function parseStructuredOutput(rawOutput, fallback = {}) {
@@ -1216,4 +1253,4 @@ export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
 }
 
-export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
+export { ADVISOR_THREAD_PREFIX, DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };

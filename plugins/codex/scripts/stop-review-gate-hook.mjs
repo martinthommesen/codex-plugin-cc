@@ -139,6 +139,17 @@ function runStopReview(cwd, input = {}) {
   }
 }
 
+function runningJobLabel(job) {
+  const kind = job.jobClass ?? job.kind;
+  if (kind === "ask") {
+    return "ask";
+  }
+  if (kind === "review") {
+    return "review";
+  }
+  return "task";
+}
+
 function main() {
   const input = readHookInput();
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -147,19 +158,21 @@ function main() {
 
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
-  const runningTaskNote = runningJob
-    ? `Codex task ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
+  // Ignore kindLabel: it is snapshotted at job creation and may carry stale naming.
+  const jobLabel = runningJob ? runningJobLabel(runningJob) : null;
+  const runningJobNote = runningJob
+    ? `Codex ${jobLabel} ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;
 
   if (!config.stopReviewGate) {
-    logNote(runningTaskNote);
+    logNote(runningJobNote);
     return;
   }
 
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
     logNote(setupNote);
-    logNote(runningTaskNote);
+    logNote(runningJobNote);
     return;
   }
 
@@ -167,12 +180,12 @@ function main() {
   if (!review.ok) {
     emitDecision({
       decision: "block",
-      reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
+      reason: runningJobNote ? `${runningJobNote} ${review.reason}` : review.reason
     });
     return;
   }
 
-  logNote(runningTaskNote);
+  logNote(runningJobNote);
 }
 
 try {

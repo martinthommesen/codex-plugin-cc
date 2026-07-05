@@ -35,13 +35,19 @@ function getJobTypeLabel(job) {
     return "review";
   }
   if (job.jobClass === "task") {
-    return "rescue";
+    return "task";
+  }
+  if (job.jobClass === "ask") {
+    return "ask";
   }
   if (job.kind === "review") {
     return "review";
   }
   if (job.kind === "task") {
-    return "rescue";
+    return "task";
+  }
+  if (job.kind === "ask") {
+    return "ask";
   }
   return "job";
 }
@@ -256,16 +262,18 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
-  const selected = matchJobReference(
-    jobs,
-    reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
-  );
+  const isFinished = (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled";
+  // Bare `result` shows the latest task/review outcome; advisor asks were already answered inline
+  // and stay reachable by explicit job id only.
+  const excludeAsk = (predicate) => (reference ? predicate : (job) => predicate(job) && job.jobClass !== "ask");
+  const selected = matchJobReference(jobs, reference, excludeAsk(isFinished));
 
   if (selected) {
     return { workspaceRoot, job: selected };
   }
 
+  // The active check stays ask-inclusive so a first-ever running ask still yields a
+  // truthful "still running" message instead of "no finished jobs".
   const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
@@ -273,6 +281,10 @@ export function resolveResultJob(cwd, reference) {
 
   if (reference) {
     throw new Error(`No finished job found for "${reference}". Run /codex:status to inspect active jobs.`);
+  }
+
+  if (jobs.some((job) => isFinished(job) && job.jobClass === "ask")) {
+    throw new Error("Latest finished jobs are advisor asks. Pass an ask job id to view an advisor result.");
   }
 
   throw new Error("No finished Codex jobs found for this repository yet.");

@@ -322,6 +322,25 @@ export function renderTaskResult(parsedResult, meta) {
   return `${message}\n`;
 }
 
+export function renderAskResult(payload) {
+  const rawOutput = typeof payload?.rawOutput === "string" ? payload.rawOutput : "";
+  const answer = rawOutput.trimEnd() || String(payload?.failureMessage ?? "").trim() || "Codex did not return a final message.";
+  const lines = [];
+  if (typeof payload?.status === "number" && payload.status !== 0) {
+    lines.push("Codex advisor turn failed.", "");
+  }
+  lines.push(answer);
+  if (payload?.threadId) {
+    const resumeLabel = payload.resumed
+      ? payload.resumeMatchedByName
+        ? "continued, matched by thread name"
+        : "continued"
+      : "new";
+    lines.push("", `Codex advisor thread: ${payload.threadId} (${resumeLabel})`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export function renderStatusReport(report) {
   const lines = [
     "# Codex Status",
@@ -390,6 +409,9 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  if ((storedJob?.jobClass ?? job.jobClass) === "ask" && storedJob?.result && typeof storedJob.result === "object") {
+    return renderAskResult(storedJob.result);
+  }
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {

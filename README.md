@@ -11,7 +11,8 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:delegate`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- the `codex:advisor` skill so Claude can ask Codex for a read-only second opinion on a persistent per-session thread
 
 ## Requirements
 
@@ -62,7 +63,7 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `codex:codex` subagent in `/agents`
 
 One simple first run is:
 
@@ -123,12 +124,13 @@ Examples:
 
 This command is read-only. It does not fix code.
 
-### `/codex:rescue`
+### `/codex:delegate`
 
-Hands a task to Codex through the `codex:codex-rescue` subagent.
+Hands a task to Codex through the `codex:codex` subagent.
 
 Use it when you want Codex to:
 
+- implement a well-specified change
 - investigate a bug
 - try a fix
 - continue a previous Codex task
@@ -137,17 +139,17 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest task thread from your current Claude session in this repo.
 
 Examples:
 
 ```bash
-/codex:rescue investigate why the tests started failing
-/codex:rescue fix the failing test with the smallest safe patch
-/codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
-/codex:rescue --background investigate the regression
+/codex:delegate investigate why the tests started failing
+/codex:delegate fix the failing test with the smallest safe patch
+/codex:delegate --resume apply the top fix from the last run
+/codex:delegate --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:delegate --model spark fix the issue quickly
+/codex:delegate --background investigate the regression
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -158,9 +160,23 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- if you do not pass `--model`, the plugin uses your Codex config's model; if neither sets one and your configured provider is OpenAI, it falls back to `gpt-5.5` on fresh threads (if the config can't be read, model selection is left to Codex). Effort still follows the Codex config or default.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- follow-up rescue requests can continue the latest Codex task in the repo
+- follow-up delegated requests can continue the latest Codex task from your current Claude session
+
+### Ask Codex for advice
+
+Claude can consult Codex as a read-only peer advisor through the `codex:advisor` skill — say "ask codex what it thinks of this plan" or just let Claude reach for it before committing to a design. Under the hood it runs:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" ask "is this migration plan sound?"
+```
+
+Each `ask` continues the session's persistent advisor thread, so follow-ups only send the new question; `--fresh` starts a new thread. Resume is automatic — `--resume`/`--resume-last` are not accepted. Asks are read-only and run in the foreground.
+
+### Codex in workflows
+
+Workflow scripts can fan out work to Codex directly — `agent(prompt, { agentType: 'codex:codex' })` — and Workflow `schema` options compose with it for structured output. Workflow subagents with Bash can also call the `ask` helper (always with `--fresh`).
 
 ### `/codex:transfer`
 
@@ -198,6 +214,7 @@ Use it to:
 
 Shows the final stored Codex output for a finished job.
 When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
+Without a job id it shows the latest finished task or review — advisor asks are skipped because their answers were already shown inline; pass the ask job id to replay one.
 
 Examples:
 
@@ -247,14 +264,14 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 ### Hand A Problem To Codex
 
 ```bash
-/codex:rescue investigate why the build is failing in CI
+/codex:delegate investigate why the build is failing in CI
 ```
 
 ### Start Something Long-Running
 
 ```bash
 /codex:adversarial-review --background
-/codex:rescue --background investigate the flaky test
+/codex:delegate --background investigate the flaky test
 ```
 
 Then check in with:
@@ -276,6 +293,8 @@ If you want to change the default reasoning effort or the default model that get
 model = "gpt-5.4-mini"
 model_reasoning_effort = "high"
 ```
+
+When `model` is absent from every config layer (and you pass no `--model`) with an OpenAI provider, the plugin falls back to `gpt-5.5` on fresh threads. Non-OpenAI `model_provider` configurations are never overridden.
 
 Your configuration will be picked up based on:
 

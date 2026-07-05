@@ -503,7 +503,7 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
-test("task-resume-candidate returns the latest rescue thread from the current session", () => {
+test("task-resume-candidate returns the latest task thread from the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -533,7 +533,7 @@ test("task-resume-candidate returns the latest rescue thread from the current se
             jobClass: "task",
             sessionId: "sess-other",
             threadId: "thr_other",
-            summary: "Old rescue run",
+            summary: "Old task run",
             updatedAt: "2026-03-24T20:05:00.000Z"
           },
           {
@@ -2256,4 +2256,680 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+function readFakeState(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+}
+
+function askEnv(binDir, sessionId) {
+  const env = { ...buildEnv(binDir) };
+  delete env.CODEX_COMPANION_SESSION_ID;
+  if (sessionId) {
+    env.CODEX_COMPANION_SESSION_ID = sessionId;
+  }
+  return env;
+}
+
+test("ask creates a named read-only advisor thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "ask", "is this plan sound?"], {
+    cwd: repo,
+    env: askEnv(binDir, "sess-current")
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task\./);
+  assert.match(result.stdout, /Codex advisor thread: thr_1 \(new\)/);
+  const state = readFakeState(binDir);
+  const thread = state.threads.find((candidate) => candidate.id === "thr_1");
+  assert.ok(thread.name.startsWith("Codex Companion Advisor"));
+  assert.equal(thread.ephemeral, false);
+  assert.equal(thread.sandbox, "read-only");
+});
+
+test("ask auto-resumes the session advisor thread read-only with only the follow-up text", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const first = run("node", [SCRIPT, "ask", "first question"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  const second = run("node", [SCRIPT, "ask", "what about edge cases?"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /Codex advisor thread: thr_1 \(continued\)/);
+
+  const state = readFakeState(binDir);
+  assert.equal(state.lastTurnStart.threadId, "thr_1");
+  assert.equal(state.lastTurnStart.prompt, "what about edge cases?");
+  const lastResume = state.resumeRequests.at(-1);
+  assert.equal(lastResume.threadId, "thr_1");
+  assert.equal(lastResume.sandbox, "read-only");
+});
+
+test("ask --fresh starts a new advisor thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const first = run("node", [SCRIPT, "ask", "first question"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  const second = run("node", [SCRIPT, "ask", "--fresh", "unrelated topic"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /Codex advisor thread: thr_2 \(new\)/);
+  assert.equal(readFakeState(binDir).lastTurnStart.threadId, "thr_2");
+});
+
+test("ask does not resume another session's advisor thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const first = run("node", [SCRIPT, "ask", "other session question"], {
+    cwd: repo,
+    env: askEnv(binDir, "sess-other")
+  });
+  assert.equal(first.status, 0, first.stderr);
+
+  const second = run("node", [SCRIPT, "ask", "current session question"], {
+    cwd: repo,
+    env: askEnv(binDir, "sess-current")
+  });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /Codex advisor thread: thr_2 \(new\)/);
+});
+
+test("ask rejects task-style execution flags instead of leaking them into the prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  for (const flag of ["--background", "--wait", "--write", "--resume", "--resume-last"]) {
+    const result = run("node", [SCRIPT, "ask", flag, "question"], { cwd: repo, env });
+    assert.equal(result.status, 1, `${flag} should be rejected`);
+    assert.match(result.stderr, new RegExp(`does not accept ${flag}`));
+  }
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+
+  const spark = run("node", [SCRIPT, "ask", "-m", "spark", "quick question"], { cwd: repo, env });
+  assert.equal(spark.status, 0, spark.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.3-codex-spark");
+});
+
+test("ask supports --json, --prompt-file, and --cwd", () => {
+  const repo = makeTempDir();
+  const otherCwd = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const json = run("node", [SCRIPT, "ask", "--json", "structured question"], { cwd: repo, env });
+  assert.equal(json.status, 0, json.stderr);
+  const payload = JSON.parse(json.stdout);
+  assert.equal(payload.status, 0);
+  assert.equal(payload.threadId, "thr_1");
+  assert.equal(payload.resumed, false);
+  assert.match(payload.rawOutput, /Handled the requested task\./);
+  assert.equal(payload.failureMessage, "");
+
+  const promptFile = path.join(repo, "question.txt");
+  fs.writeFileSync(promptFile, "file question\n", "utf8");
+  const fromFile = run("node", [SCRIPT, "ask", "--prompt-file", "question.txt"], { cwd: repo, env });
+  assert.equal(fromFile.status, 0, fromFile.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.prompt, "file question");
+
+  fs.writeFileSync(promptFile, " \n\t", "utf8");
+  const blankFile = run("node", [SCRIPT, "ask", "--prompt-file", "question.txt"], { cwd: repo, env });
+  assert.equal(blankFile.status, 1);
+  assert.match(blankFile.stderr, /Provide a question/);
+
+  const viaCwd = run("node", [SCRIPT, "ask", "--cwd", repo, "cwd question"], { cwd: otherCwd, env });
+  assert.equal(viaCwd.status, 0, viaCwd.stderr);
+  const stateDir = resolveStateDir(repo);
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  assert.equal(jobs[0].kind, "ask");
+});
+
+test("ask preflight failure leaves a failed tracked job that result renders generically", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  const env = {
+    ...process.env,
+    PATH: binDir,
+    CODEX_COMPANION_SESSION_ID: "sess-current"
+  };
+
+  const result = run("node", [SCRIPT, "ask", "will this fail?"], { cwd: repo, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Codex CLI is not installed/);
+
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const askJob = state.jobs.find((job) => job.jobClass === "ask");
+  assert.equal(askJob.status, "failed");
+
+  const stored = run("node", [SCRIPT, "result", askJob.id], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(stored.stdout, /Codex CLI is not installed/);
+  assert.doesNotMatch(stored.stdout, /Codex advisor thread:/);
+});
+
+test("ask stays out of task resume and default result selection", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const task = run("node", [SCRIPT, "task", "implement the thing"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+
+  const ask = run("node", [SCRIPT, "ask", "what do you think?"], { cwd: repo, env });
+  assert.equal(ask.status, 0, ask.stderr);
+
+  const candidate = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo, env });
+  assert.equal(candidate.status, 0, candidate.stderr);
+  const candidatePayload = JSON.parse(candidate.stdout);
+  assert.equal(candidatePayload.available, true);
+  assert.equal(candidatePayload.candidate.threadId, "thr_1");
+
+  const result = run("node", [SCRIPT, "result"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /Codex advisor thread:/);
+
+  const stateDir = resolveStateDir(repo);
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const askJob = jobs.find((job) => job.jobClass === "ask");
+  const askResult = run("node", [SCRIPT, "result", askJob.id], { cwd: repo, env });
+  assert.equal(askResult.status, 0, askResult.stderr);
+  assert.match(askResult.stdout, /Codex advisor thread: thr_2/);
+});
+
+test("result without a job id explains when only advisor asks have finished", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const ask = run("node", [SCRIPT, "ask", "only an ask here"], { cwd: repo, env });
+  assert.equal(ask.status, 0, ask.stderr);
+
+  const result = run("node", [SCRIPT, "result"], { cwd: repo, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Latest finished jobs are advisor asks/);
+});
+
+test("status labels completed and running ask jobs as ask", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const ask = run("node", [SCRIPT, "ask", "status labelling question"], { cwd: repo, env });
+  assert.equal(ask.status, 0, ask.stderr);
+
+  const finished = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(finished.status, 0, finished.stderr);
+  const finishedReport = JSON.parse(finished.stdout);
+  assert.equal(finishedReport.latestFinished.kindLabel, "ask");
+
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.unshift({
+    id: "ask-live",
+    status: "running",
+    title: "Codex Advisor",
+    jobClass: "ask",
+    sessionId: "sess-current",
+    summary: "Live advisor question",
+    updatedAt: "2099-01-01T00:00:00.000Z"
+  });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const running = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(running.status, 0, running.stderr);
+  const runningReport = JSON.parse(running.stdout);
+  assert.equal(runningReport.running[0].id, "ask-live");
+  assert.equal(runningReport.running[0].kindLabel, "ask");
+});
+
+test("ask without a session id falls back to the advisor thread from thread/list", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, null);
+
+  const first = run("node", [SCRIPT, "ask", "seed the advisor thread"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  fs.rmSync(resolveStateDir(repo), { recursive: true, force: true });
+
+  const second = run("node", [SCRIPT, "ask", "resume without local jobs"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /Codex advisor thread: thr_1 \(continued, matched by thread name\)/);
+  assert.equal(readFakeState(binDir).lastTurnStart.threadId, "thr_1");
+});
+
+test("stop hook labels a running ask job as ask", () => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const runningLog = path.join(jobsDir, "ask-live.log");
+  fs.writeFileSync(runningLog, "running\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "ask-live",
+            status: "running",
+            title: "Codex Advisor",
+            jobClass: "ask",
+            sessionId: "sess-current",
+            logFile: runningLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({ cwd: repo })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Codex ask ask-live is still running/i);
+  assert.match(result.stderr, /\/codex:cancel ask-live/i);
+});
+
+test("ask self-heals around interrupted ask jobs", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+  const stateDir = resolveStateDir(repo);
+  const statePath = path.join(stateDir, "state.json");
+
+  // An ask killed before its thread was created leaves a running record without a
+  // threadId — nothing to resume, so the next ask starts fresh.
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    statePath,
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "ask-stuck-no-thread",
+            status: "running",
+            title: "Codex Advisor",
+            jobClass: "ask",
+            sessionId: "sess-current",
+            summary: "Interrupted before thread creation",
+            updatedAt: "2099-01-01T00:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const fresh = run("node", [SCRIPT, "ask", "no resumable thread yet"], { cwd: repo, env });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.match(fresh.stdout, /Codex advisor thread: thr_1 \(new\)/);
+
+  // An ask killed AFTER thread creation leaves a running record with a threadId.
+  // The next ask must resume that thread so the conversation context survives.
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  for (const job of state.jobs) {
+    if (job.threadId === "thr_1") {
+      job.status = "running";
+      job.updatedAt = "2099-01-02T00:00:00.000Z";
+    }
+  }
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+
+  const resumed = run("node", [SCRIPT, "ask", "continue after the interruption"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.match(resumed.stdout, /Codex advisor thread: thr_1 \(continued\)/);
+});
+
+test("task without --model falls back to gpt-5.5 when config sets no model", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.5");
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).latestFinished.kindLabel, "task");
+});
+
+test("task without --model defers to a config-set model", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "config-with-model");
+
+  const result = run("node", [SCRIPT, "task", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, null);
+});
+
+test("explicit --model skips the config lookup entirely", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = readFakeState(binDir);
+  assert.equal(state.lastTurnStart.model, "gpt-5.3-codex-spark");
+  assert.equal(state.configReadCount ?? 0, 0);
+});
+
+test("task survives a config/read failure and keeps the null model", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "config-read-fails");
+
+  const result = run("node", [SCRIPT, "task", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, null);
+});
+
+test("review without a model falls back to gpt-5.5 when config sets none", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "review"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastThreadStart.model, "gpt-5.5");
+});
+
+test("review_model in config suppresses the review fallback but not the task fallback", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "config-with-review-model");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const review = run("node", [SCRIPT, "review"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(readFakeState(binDir).lastThreadStart.model, null);
+
+  const task = run("node", [SCRIPT, "task", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(task.status, 0, task.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.5");
+});
+
+test("ask falls back to gpt-5.5 on fresh threads and keeps null on auto-resume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const first = run("node", [SCRIPT, "ask", "first question"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const afterFirst = readFakeState(binDir);
+  assert.equal(afterFirst.lastTurnStart.model, "gpt-5.5");
+  const configReadsAfterFirst = afterFirst.configReadCount;
+
+  const second = run("node", [SCRIPT, "ask", "follow up"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  const afterSecond = readFakeState(binDir);
+  assert.equal(afterSecond.lastTurnStart.model, null);
+  assert.equal(afterSecond.configReadCount, configReadsAfterFirst);
+});
+
+test("task --resume-last keeps the null model on the resumed thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const first = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, null);
+
+  const explicitResume = run("node", [SCRIPT, "task", "--resume-last", "--model", "spark", "one more"], { cwd: repo, env });
+  assert.equal(explicitResume.status, 0, explicitResume.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.3-codex-spark");
+});
+
+test("alternate model providers never receive the gpt-5.5 fallback", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "provider-no-auth");
+
+  const result = run("node", [SCRIPT, "task", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, null);
+});
+
+test("a failed ask turn renders loudly, keeps its thread, and stays resumable", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = askEnv(binDir, "sess-current");
+
+  const failed = run("node", [SCRIPT, "ask", "FAIL_THIS_TURN please"], { cwd: repo, env });
+  assert.equal(failed.status, 1);
+  assert.match(failed.stdout, /Codex advisor turn failed\./);
+  assert.match(failed.stdout, /Codex advisor thread: thr_1 \(new\)/);
+
+  const stateDir = resolveStateDir(repo);
+  const jobs = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs;
+  const askJob = jobs.find((job) => job.jobClass === "ask");
+  assert.equal(askJob.status, "failed");
+  assert.equal(askJob.threadId, "thr_1");
+
+  // The failed ask's thread is resumed on the next healthy turn.
+  const recovered = run("node", [SCRIPT, "ask", "try again"], { cwd: repo, env });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /Codex advisor thread: thr_1 \(continued\)/);
+});
+
+test("adversarial review honors a config-set review_model", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "config-with-review-model");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "adversarial-review"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastThreadStart.model, null);
+});
+
+test("a whitespace-only config model still triggers the gpt-5.5 fallback", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "config-with-blank-model");
+
+  const result = run("node", [SCRIPT, "task", "do the thing"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, "gpt-5.5");
+});
+
+test("stop hook labels a running review job as review", () => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const runningLog = path.join(jobsDir, "review-live.log");
+  fs.writeFileSync(runningLog, "running\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "review-live",
+            status: "running",
+            title: "Codex Review",
+            jobClass: "review",
+            sessionId: "sess-current",
+            logFile: runningLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({ cwd: repo })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Codex review review-live is still running/i);
+});
+
+test("stop hook falls back to legacy job kind when jobClass is absent", () => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const runningLog = path.join(jobsDir, "review-live.log");
+  fs.writeFileSync(runningLog, "running\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "legacy-review-live",
+            kind: "review",
+            kindLabel: "task",
+            status: "running",
+            title: "Codex Review",
+            sessionId: "sess-current",
+            logFile: runningLog,
+            createdAt: "2026-03-18T15:32:00.000Z",
+            updatedAt: "2026-03-18T15:33:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    },
+    input: JSON.stringify({ cwd: repo })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Codex review legacy-review-live is still running/i);
+});
+
+test("result without a job id reports a first-ever running ask as still running", () => {
+  const repo = makeTempDir();
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "ask-live",
+            status: "running",
+            title: "Codex Advisor",
+            jobClass: "ask",
+            sessionId: "sess-current",
+            summary: "Live advisor question",
+            updatedAt: "2099-01-01T00:00:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "result"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      CODEX_COMPANION_SESSION_ID: "sess-current"
+    }
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Job ask-live is still running/);
 });
