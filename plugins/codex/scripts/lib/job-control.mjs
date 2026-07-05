@@ -226,7 +226,9 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const allJobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  // Stop-gate reviews are internal; hide them from the default view (visible with --all).
+  const jobs = options.all ? allJobs : allJobs.filter((job) => job.jobClass !== "stop-review");
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -270,10 +272,11 @@ export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
   const isFinished = (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled";
-  // Bare `result` shows the latest task/review outcome; advisor asks were already answered inline
-  // and stay reachable by explicit job id only.
-  const excludeAsk = (predicate) => (reference ? predicate : (job) => predicate(job) && job.jobClass !== "ask");
-  const selected = matchJobReference(jobs, reference, excludeAsk(isFinished));
+  // Bare `result` shows the latest task/review outcome. Advisor asks were answered inline, and
+  // stop-gate reviews are internal — both stay reachable by explicit job id only.
+  const excludeInternal = (predicate) =>
+    reference ? predicate : (job) => predicate(job) && job.jobClass !== "ask" && job.jobClass !== "stop-review";
+  const selected = matchJobReference(jobs, reference, excludeInternal(isFinished));
 
   if (selected) {
     return { workspaceRoot, job: selected };

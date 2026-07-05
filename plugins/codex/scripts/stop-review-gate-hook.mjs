@@ -97,7 +97,8 @@ function runStopReview(cwd, input = {}) {
     cwd,
     env: childEnv,
     encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
+    timeout: STOP_REVIEW_TIMEOUT_MS,
+    maxBuffer: 64 * 1024 * 1024
   });
 
   if (result.error?.code === "ETIMEDOUT") {

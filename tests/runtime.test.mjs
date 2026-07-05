@@ -1366,6 +1366,62 @@ test("result returns the stored output for the latest finished job by default", 
   );
 });
 
+test("stop-gate reviews are hidden from default result/status but visible with --all", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" };
+  seedStateFixture(stateDir, {
+    jobs: [
+      {
+        id: "task-real",
+        status: "completed",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-current",
+        threadId: "thr_task",
+        summary: "Real user task",
+        rendered: "Real task output.\n",
+        createdAt: "2026-03-18T15:10:00.000Z",
+        updatedAt: "2026-03-18T15:11:00.000Z"
+      },
+      {
+        // Newer than the real task — must NOT displace it in the default view.
+        id: "task-stopgate",
+        status: "completed",
+        title: "Codex Stop Gate Review",
+        jobClass: "stop-review",
+        sessionId: "sess-current",
+        threadId: "thr_stop",
+        summary: "Stop-gate review",
+        rendered: "ALLOW: looks good\n",
+        createdAt: "2026-03-18T15:12:00.000Z",
+        updatedAt: "2026-03-18T15:13:00.000Z"
+      }
+    ]
+  });
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: workspace, env });
+  assert.equal(status.status, 0, status.stderr);
+  const statusReport = JSON.parse(status.stdout);
+  assert.equal(statusReport.latestFinished.id, "task-real");
+  assert.equal(
+    [statusReport.latestFinished.id, ...statusReport.recent.map((job) => job.id)].includes("task-stopgate"),
+    false
+  );
+
+  const statusAll = run("node", [SCRIPT, "status", "--all", "--json"], { cwd: workspace, env });
+  const statusAllReport = JSON.parse(statusAll.stdout);
+  assert.equal(
+    [statusAllReport.latestFinished?.id, ...statusAllReport.recent.map((job) => job.id)].includes("task-stopgate"),
+    true
+  );
+
+  const result = run("node", [SCRIPT, "result"], { cwd: workspace, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Real task output\./);
+  assert.doesNotMatch(result.stdout, /ALLOW: looks good/);
+});
+
 test("result without a job id prefers the latest finished job from the current Claude session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
@@ -1879,7 +1935,8 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
-  const status = run("node", [SCRIPT, "status"], {
+  // Stop-gate reviews are internal: hidden from the default view, visible with --all.
+  const status = run("node", [SCRIPT, "status", "--all"], {
     cwd: repo,
     env: {
       ...buildEnv(binDir),

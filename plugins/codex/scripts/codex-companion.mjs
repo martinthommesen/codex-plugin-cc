@@ -598,6 +598,7 @@ function buildReviewJobMetadata(reviewName, target) {
 function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
+      jobClass: "stop-review",
       title: "Codex Stop Gate Review",
       summary: "Stop-gate review of previous Claude turn"
     };
@@ -606,6 +607,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   const title = resumeLast ? "Codex Resume" : "Codex Task";
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
+    jobClass: "task",
     title,
     summary: shorten(prompt || fallbackSummary)
   };
@@ -645,7 +647,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     kind: "task",
     title: taskMetadata.title,
     workspaceRoot,
-    jobClass: "task",
+    jobClass: taskMetadata.jobClass ?? "task",
     summary: taskMetadata.summary,
     write
   });
