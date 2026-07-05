@@ -702,3 +702,10 @@ export function buildEnv(binDir) {
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }
+
+export function buildHomeEnv(home) {
+  return {
+    HOME: home,
+    USERPROFILE: home
+  };
+}

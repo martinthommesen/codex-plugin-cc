@@ -16,7 +16,7 @@ export function resolveExecutable(command, { platform = process.platform, env = 
     .map((ext) => ext.trim())
     .filter(Boolean);
   for (const dir of (env.PATH || "").split(";").filter(Boolean)) {
-    for (const ext of ["", ...exts]) {
+    for (const ext of exts) {
       const candidate = path.join(dir, `${command}${ext}`);
       if (fs.existsSync(candidate)) {
         return candidate;

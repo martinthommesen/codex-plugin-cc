@@ -78,6 +78,7 @@ test("resolveExecutable prefers a real .exe over a .cmd on the Windows PATH", ()
 test("spawnConfigFor: a real Windows exe runs shell-free, a .cmd shim runs through a shell", () => {
   const dir = makeTempDir();
   fs.writeFileSync(path.join(dir, "git.exe"), "");
+  fs.writeFileSync(path.join(dir, "codex"), "");
   fs.writeFileSync(path.join(dir, "codex.cmd"), "");
   const env = { PATH: dir, PATHEXT: ".exe;.cmd" };
 
