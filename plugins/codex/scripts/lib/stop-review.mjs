@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { resolveStateDir } from "./state.mjs";
+import { ensureStateDir, resolveStateDir, writeFileAtomic } from "./state.mjs";
 
 export const STOP_REVIEW_GATE_PAUSED_MESSAGE =
   "review gate auto-paused after one block for this session; re-enable with `/codex:setup --enable-review-gate`.";
@@ -25,8 +25,8 @@ export function pauseStopReviewGate(cwd, sessionId) {
   if (!marker) {
     return false;
   }
-  fs.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(marker, new Date().toISOString(), { encoding: "utf8", mode: 0o600 });
+  ensureStateDir(cwd);
+  writeFileAtomic(marker, `${new Date().toISOString()}\n`);
   return true;
 }
 

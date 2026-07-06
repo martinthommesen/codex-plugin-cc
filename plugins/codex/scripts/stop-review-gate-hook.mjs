@@ -113,9 +113,9 @@ function main() {
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const sessionId = getCurrentSessionId({ input });
+  const sessionId = getCurrentSessionId({ input, env: process.env });
 
-  const jobs = filterJobsForCurrentSession(listJobs(workspaceRoot), { input });
+  const jobs = filterJobsForCurrentSession(listJobs(workspaceRoot), { input, env: process.env });
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
   const jobLabel = runningJob ? getJobTypeLabel(runningJob) : null;
   const runningJobNote = runningJob

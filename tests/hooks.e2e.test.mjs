@@ -267,10 +267,12 @@ h.test("stop hook runs a stop-time review task and blocks on findings when the r
 
   const skipped = h.run("node", [h.STOP_HOOK], {
     cwd: repo,
-    env: h.buildEnv(binDir),
+    env: {
+      ...h.buildEnv(binDir),
+      CODEX_COMPANION_SESSION_ID: "sess-stop-review"
+    },
     input: JSON.stringify({
       cwd: repo,
-      session_id: "sess-stop-review",
       last_assistant_message: "This stop should be allowed without another review."
     })
   });
@@ -324,7 +326,9 @@ h.test("stop hook logs running tasks to stderr without blocking when the review 
   h.fs.mkdirSync(jobsDir, { recursive: true });
 
   const runningLog = h.path.join(jobsDir, "task-running.log");
+  const otherRunningLog = h.path.join(jobsDir, "task-other.log");
   h.fs.writeFileSync(runningLog, "running\n", "utf8");
+  h.fs.writeFileSync(otherRunningLog, "other running\n", "utf8");
 
   h.seedStateFixture(stateDir, {
     version: 1,
@@ -341,6 +345,16 @@ h.test("stop hook logs running tasks to stderr without blocking when the review 
         logFile: runningLog,
         createdAt: "2026-03-18T15:32:00.000Z",
         updatedAt: "2026-03-18T15:33:00.000Z"
+      },
+      {
+        id: "task-other",
+        status: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        sessionId: "sess-other",
+        logFile: otherRunningLog,
+        createdAt: "2026-03-18T15:34:00.000Z",
+        updatedAt: "2026-03-18T15:35:00.000Z"
       }
     ]
   });
@@ -357,6 +371,7 @@ h.test("stop hook logs running tasks to stderr without blocking when the review 
   h.assert.equal(blocked.status, 0, blocked.stderr);
   h.assert.equal(blocked.stdout.trim(), "");
   h.assert.match(blocked.stderr, /Codex task task-live is still running/i);
+  h.assert.doesNotMatch(blocked.stderr, /task-other/i);
   h.assert.match(blocked.stderr, /\/codex:status/i);
   h.assert.match(blocked.stderr, /\/codex:cancel task-live/i);
 });
