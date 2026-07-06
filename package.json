@@ -11,15 +11,18 @@
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/bump-version.mjs --check",
-    "prebuild": "node -e \"require('node:fs').mkdirSync('plugins/codex/.generated/app-server-types',{recursive:true})\" && codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
+    "prebuild": "node -e \"require('node:fs').mkdirSync('plugins/codex/.generated/app-server-types',{recursive:true})\" && npx --no-install codex app-server generate-ts --out plugins/codex/.generated/app-server-types",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1",
+    "test:watch": "node --test --watch",
+    "test:unit": "node --test tests/args.test.mjs tests/broker-endpoint.test.mjs tests/bump-version.test.mjs tests/commands.test.mjs tests/git.test.mjs tests/job-control.test.mjs tests/model-resolution.test.mjs tests/process.test.mjs tests/render.test.mjs tests/state.test.mjs tests/stop-review.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
+    "@openai/codex": "0.142.5",
     "@types/node": "^20.19.0",
     "eslint": "^9.13.0",
     "globals": "^15.11.0",

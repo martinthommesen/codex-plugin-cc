@@ -19,6 +19,7 @@ import {
   sweepJobs,
   updateJobFile,
   writeCancelMarker,
+  writeCrashMarker,
   writeFileAtomic,
   writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
@@ -262,6 +263,90 @@ test("sweepJobs reaps a crashed active job but preserves a live one", () => {
   writeJobFile(live, "job-live", { status: "running", pid: 424242, updatedAt: "2026-01-01T00:00:00.000Z" });
   sweepJobs(live, { isJobAlive: () => true });
   assert.equal(listJobs(live)[0].status, "running");
+});
+
+test("sweepJobs includes newly crashed jobs in the terminal cap", () => {
+  const workspace = makeTempDir();
+  for (let index = 0; index < 51; index += 1) {
+    writeJobFile(workspace, `job-${index}`, { status: "running", pid: 4242 + index });
+  }
+
+  sweepJobs(workspace, { isJobAlive: () => false });
+
+  const jobs = listJobs(workspace);
+  assert.equal(jobs.length, 50);
+  assert.equal(
+    jobs.every((job) => job.status === "failed"),
+    true
+  );
+});
+
+test("crash marker is subordinate to a terminal job record", () => {
+  const workspace = makeTempDir();
+
+  writeJobFile(workspace, "job-wins", { status: "running", pid: 4242 });
+  writeCrashMarker(workspace, "job-wins");
+  updateJobFile(workspace, "job-wins", { status: "completed", pid: null, completedAt: "2026-01-01T00:00:00.000Z" });
+  assert.equal(listJobs(workspace)[0].status, "completed");
+
+  writeJobFile(workspace, "job-still-wins", { status: "completed", pid: null });
+  writeCrashMarker(workspace, "job-still-wins");
+  assert.equal(
+    Object.fromEntries(listJobs(workspace).map((job) => [job.id, job]))["job-still-wins"].status,
+    "completed"
+  );
+});
+
+test("crash marker overlays active jobs with failed status and crash timestamp", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-crashed", {
+    status: "running",
+    pid: 4242,
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  });
+  writeCrashMarker(workspace, "job-crashed");
+
+  const job = listJobs(workspace)[0];
+  assert.equal(job.status, "failed");
+  assert.equal(job.phase, "failed");
+  assert.equal(job.pid, null);
+  assert.equal(job.pidStartTime, null);
+  assert.equal(job.completedAt, job.updatedAt);
+  assert.match(job.errorMessage, /exited without finalizing/);
+});
+
+test("sweepJobs does not delete a job that completes while being reaped", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-raced", { status: "running", pid: 4242 });
+  for (let index = 0; index < 50; index += 1) {
+    writeJobFile(workspace, `old-${index}`, { status: "completed" });
+  }
+
+  sweepJobs(workspace, {
+    isJobAlive() {
+      updateJobFile(workspace, "job-raced", { status: "completed", pid: null });
+      return false;
+    }
+  });
+
+  const jobs = Object.fromEntries(listJobs(workspace).map((job) => [job.id, job]));
+  assert.equal(jobs["job-raced"].status, "completed");
+});
+
+test("sweepJobs preserves live jobs when pid identity is temporarily unreadable", () => {
+  const workspace = makeTempDir();
+  writeJobFile(workspace, "job-live", {
+    status: "running",
+    pid: 4242,
+    pidStartTime: "start-a"
+  });
+
+  sweepJobs(workspace, {
+    isProcessAlive: () => true,
+    getProcessStartTime: () => null
+  });
+
+  assert.equal(listJobs(workspace)[0].status, "running");
 });
 
 test("sweepJobs verifies stored pid identity before preserving active jobs", () => {

@@ -8,8 +8,14 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import {
+  isStopReviewGatePaused,
+  parseStopReviewOutput,
+  pauseStopReviewGate,
+  STOP_REVIEW_GATE_PAUSED_MESSAGE
+} from "./lib/stop-review.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
-import { filterJobsForCurrentSession, getJobTypeLabel, sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { filterJobsForCurrentSession, getCurrentSessionId, getJobTypeLabel } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/constants.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -55,35 +61,6 @@ function buildSetupNote(cwd) {
 
   const detail = availability.detail ? ` ${availability.detail}.` : "";
   return `Codex is not set up for the review gate.${detail} Run /codex:setup.`;
-}
-
-function parseStopReviewOutput(rawOutput) {
-  const text = String(rawOutput ?? "").trim();
-  if (!text) {
-    return {
-      ok: false,
-      reason:
-        "The stop-time Codex review task returned no final output. Run /codex:review --wait manually or bypass the gate."
-    };
-  }
-
-  const firstLine = text.split(/\r?\n/, 1)[0].trim();
-  if (firstLine.startsWith("ALLOW:")) {
-    return { ok: true, reason: null };
-  }
-  if (firstLine.startsWith("BLOCK:")) {
-    const reason = firstLine.slice("BLOCK:".length).trim() || text;
-    return {
-      ok: false,
-      reason: `Codex stop-time review found issues that still need fixes before ending the session: ${reason}`
-    };
-  }
-
-  return {
-    ok: false,
-    reason:
-      "The stop-time Codex review task returned an unexpected answer. Run /codex:review --wait manually or bypass the gate."
-  };
 }
 
 function runStopReview(cwd, input = {}) {
@@ -136,8 +113,9 @@ function main() {
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
+  const sessionId = getCurrentSessionId({ input });
 
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), { input }));
+  const jobs = filterJobsForCurrentSession(listJobs(workspaceRoot), { input });
   const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
   const jobLabel = runningJob ? getJobTypeLabel(runningJob) : null;
   const runningJobNote = runningJob
@@ -156,11 +134,19 @@ function main() {
     return;
   }
 
+  if (isStopReviewGatePaused(workspaceRoot, sessionId)) {
+    logNote(STOP_REVIEW_GATE_PAUSED_MESSAGE);
+    logNote(runningJobNote);
+    return;
+  }
+
   const review = runStopReview(cwd, input);
   if (!review.ok) {
+    const paused = review.blocked ? pauseStopReviewGate(workspaceRoot, sessionId) : false;
+    const pauseNote = paused ? ` ${STOP_REVIEW_GATE_PAUSED_MESSAGE}` : "";
     emitDecision({
       decision: "block",
-      reason: runningJobNote ? `${runningJobNote} ${review.reason}` : review.reason
+      reason: runningJobNote ? `${runningJobNote} ${review.reason}${pauseNote}` : `${review.reason}${pauseNote}`
     });
     return;
   }
@@ -168,10 +154,12 @@ function main() {
   logNote(runningJobNote);
 }
 
-try {
-  main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  }
 }

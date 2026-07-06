@@ -17,6 +17,7 @@ import { listJobs, removeJob } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { PLUGIN_DATA_ENV, SESSION_ID_ENV } from "./lib/constants.mjs";
+import { clearStopReviewGatePause } from "./lib/stop-review.mjs";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -89,7 +90,9 @@ async function handleSessionEnd(input) {
     await sendBrokerShutdown(brokerEndpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  cleanupSessionJobs(cwd, sessionId);
+  clearStopReviewGatePause(resolveWorkspaceRoot(cwd), sessionId);
   teardownBrokerSession({
     endpoint: brokerEndpoint,
     pidFile,

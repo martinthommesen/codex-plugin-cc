@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { loadBrokerSession, teardownBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 // Hermetic tests: drop ambient plugin session vars (CODEX_COMPANION_*,
 // CLAUDE_PLUGIN_DATA) so the suite behaves identically inside a Claude Code
@@ -32,6 +34,85 @@ export function run(command, args, options = {}) {
     shell: process.platform === "win32" && !path.isAbsolute(command),
     windowsHide: true
   });
+}
+
+const brokerCleanupReposByTest = new WeakMap();
+const brokerCleanupRepos = new Set();
+const brokerCleanupSessions = [];
+
+function cleanupBrokerRecords(repos, sessions) {
+  const records = [...sessions];
+  for (const cleanupRepo of repos) {
+    records.push(loadBrokerSession(cleanupRepo) ?? {});
+  }
+
+  const seen = new Set();
+  for (const cleanupSession of records) {
+    const key = `${cleanupSession.pid ?? ""}:${cleanupSession.sessionDir ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    teardownBrokerSession({
+      ...cleanupSession,
+      killProcess: terminateProcessTree
+    });
+    if (Number.isFinite(cleanupSession.pid) && process.platform !== "win32") {
+      try {
+        process.kill(-cleanupSession.pid, "SIGKILL");
+      } catch {
+        // Best-effort test cleanup only.
+      }
+    }
+  }
+}
+
+function reapOrphanedTestBrokers() {
+  if (process.platform === "win32") {
+    return;
+  }
+  const result = run("ps", ["-eo", "pid=,command="]);
+  if (result.status !== 0) {
+    return;
+  }
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (!line.includes("app-server-broker.mjs serve") || !line.includes("codex-plugin-test-")) {
+      continue;
+    }
+    const pid = Number(line.trim().split(/\s+/, 1)[0]);
+    if (!Number.isFinite(pid)) {
+      continue;
+    }
+    try {
+      // ponytail: POSIX-only test cleanup sweep; add a Windows taskkill branch if CI ever shows broker leaks there.
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // Best-effort test cleanup only.
+    }
+  }
+}
+
+process.once("exit", () => {
+  cleanupBrokerRecords(brokerCleanupRepos, brokerCleanupSessions);
+  reapOrphanedTestBrokers();
+});
+
+export function cleanupBroker(t, repo, session = null) {
+  if (!repo) {
+    return;
+  }
+  let cleanup = brokerCleanupReposByTest.get(t);
+  if (!cleanup) {
+    cleanup = { repos: new Set(), sessions: [] };
+    brokerCleanupReposByTest.set(t, cleanup);
+    t.after(() => cleanupBrokerRecords(cleanup.repos, cleanup.sessions));
+  }
+  cleanup.repos.add(repo);
+  brokerCleanupRepos.add(repo);
+  if (session) {
+    cleanup.sessions.push(session);
+    brokerCleanupSessions.push(session);
+  }
 }
 
 // --- state fixtures (single per-job store) ---------------------------------

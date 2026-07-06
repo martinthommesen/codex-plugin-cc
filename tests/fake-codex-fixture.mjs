@@ -253,6 +253,9 @@ function taskPayload(prompt, resume) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
     }
+    if (BEHAVIOR === "stop-review-unexpected") {
+      return "Unexpected review output.";
+    }
     return "BLOCK: Missing empty-state guard in src/app.js:4-6.";
   }
 
@@ -473,6 +476,11 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "exit-on-first-turn" && !state.exitedOnTurnStart) {
+	          state.exitedOnTurnStart = true;
+	          saveState(state);
+	          process.exit(1);
+	        }
 	        if (BEHAVIOR === "turn-errors-with-stderr") {
 	          process.stderr.write("broker stderr head marker\\n" + "x".repeat(4200) + "\\nbroker stderr tail marker\\n");
 	          throw new Error("turn/start failed with stderr");

@@ -30,6 +30,7 @@ import { shorten } from "./lib/text.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, getProcessStartTime, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { clearStopReviewGatePause } from "./lib/stop-review.mjs";
 import {
   generateJobId,
   getConfig,
@@ -47,8 +48,7 @@ import {
   getCurrentSessionId,
   readStoredJob,
   resolveCancelableJob,
-  resolveResultJob,
-  sortJobsNewestFirst
+  resolveResultJob
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
@@ -225,6 +225,7 @@ async function handleSetup(argv) {
 
   if (options["enable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", true);
+    clearStopReviewGatePause(workspaceRoot, getCurrentSessionId({ env: process.env }));
     actionsTaken.push(`Enabled the stop-time review gate for ${workspaceRoot}.`);
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
@@ -321,7 +322,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = listJobs(workspaceRoot).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentSession(jobs);
   const activeTask = visibleJobs.find(
     (job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running")
@@ -344,9 +345,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
 
 async function resolveAdvisorThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = filterJobsForCurrentSession(
-    sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId)
-  );
+  const jobs = filterJobsForCurrentSession(listJobs(workspaceRoot).filter((job) => job.id !== options.excludeJobId));
   // Any ask job with a threadId counts, including stuck "running" records: a killed
   // foreground ask already created its thread, so resuming preserves the conversation;
   // if the process is genuinely still live, the busy-thread turn error is loud.
@@ -1052,7 +1051,7 @@ function handleTaskResumeCandidate(argv) {
 
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentSessionId();
-  const jobs = filterJobsForCurrentSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentSession(listJobs(workspaceRoot));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -1189,8 +1188,10 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}
