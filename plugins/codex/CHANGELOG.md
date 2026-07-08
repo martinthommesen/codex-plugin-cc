@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.1
+
+- Hardened broker lifecycle, job state cleanup, and stop-review gate pause handling so background tasks and review gates fail visibly and clean up after the owning session.
+- Split the large runtime test file into focused e2e suites and added coverage for broker, model-resolution, review, setup, status/result/cancel, task, and transfer flows.
+- Pinned app-server type generation to the repository's `@openai/codex` dev dependency and removed the pull-request CI workflow.
+
 ## 2.1.0
 
 - The plugin now targets GPT-5.5. When you pass no `--model` and no Codex config layer sets one, fresh threads fall back to `gpt-5.5`; an explicit `--model`, a config-set `model` (or `review_model` for reviews, including adversarial reviews), any non-OpenAI `model_provider`, and resumed threads are never overridden. Config lookup failures are logged to progress and leave model selection to Codex.
