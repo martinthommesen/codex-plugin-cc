@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { BROKER_READY_TIMEOUT_ENV } from "./constants.mjs";
 import { ensureStateDir, resolveStateDir, writeFileAtomic } from "./state.mjs";
 import { getProcessStartTime } from "./process.mjs";
 
@@ -44,17 +45,31 @@ export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
 export async function sendBrokerShutdown(endpoint) {
   await /** @type {Promise<void>} */ (
     new Promise((resolve) => {
+      let finished = false;
       const socket = connectToEndpoint(endpoint);
+      const finish = () => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        socket.destroy();
+        finish();
+      }, 1500);
+      timer.unref?.();
       socket.setEncoding("utf8");
       socket.on("connect", () => {
         socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
       });
       socket.on("data", () => {
         socket.end();
-        resolve();
+        finish();
       });
-      socket.on("error", resolve);
-      socket.on("close", resolve);
+      socket.on("error", finish);
+      socket.on("close", finish);
     })
   );
 }
@@ -174,7 +189,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
   const pid = child.pid ?? null;
   const pidStartTime = getProcessStartTime(pid ?? Number.NaN);
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  const env = options.env ?? process.env;
+  const configured = Number(env[BROKER_READY_TIMEOUT_ENV]);
+  const timeoutMs = options.timeoutMs ?? (Number.isFinite(configured) && configured > 0 ? configured : 2000);
+  const ready = await waitForBrokerEndpoint(endpoint, timeoutMs);
   if (!ready) {
     teardownBrokerSession({
       endpoint,

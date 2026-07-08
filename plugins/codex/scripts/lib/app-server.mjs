@@ -21,6 +21,7 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+const MAX_STDERR_CHARS = 64 * 1024;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -43,6 +44,11 @@ const DEFAULT_CAPABILITIES = {
 
 function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
+}
+
+function appendBoundedText(current, chunk, maxChars = MAX_STDERR_CHARS) {
+  const combined = `${current}${chunk}`;
+  return combined.length > maxChars ? combined.slice(-maxChars) : combined;
 }
 
 function createProtocolError(message, data) {
@@ -172,6 +178,7 @@ class AppServerClientBase {
     }
 
     this.exitResolved = true;
+    this.closed = true;
     this.exitError = error ?? null;
 
     for (const pending of this.pending.values()) {
@@ -206,7 +213,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.stderr = appendBoundedText(this.stderr, chunk);
     });
 
     this.proc.on("error", (error) => {

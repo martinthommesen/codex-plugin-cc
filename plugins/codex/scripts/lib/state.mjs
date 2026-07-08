@@ -12,11 +12,13 @@ const CONFIG_FILE_NAME = "config.json";
 const LEGACY_STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const CANCEL_MARKER_SUFFIX = ".cancelled";
+const CRASH_MARKER_SUFFIX = ".crashed";
 const LEGACY_FALLBACK_STATE_ROOT = path.join(os.tmpdir(), "codex-companion");
 const MAX_TERMINAL_JOBS = 50;
 // A queued job that never records a worker pid within this window is treated as
 // a crashed launch and reaped by sweepJobs.
 const STALE_QUEUED_MS = 2 * 60 * 1000;
+const migratedLegacyCwds = new Set();
 
 function nowIso() {
   return new Date().toISOString();
@@ -285,6 +287,11 @@ function migrateLegacyJob(cwd, legacyStateDir, legacyJob) {
 }
 
 function migrateLegacyState(cwd) {
+  const key = path.resolve(cwd);
+  if (migratedLegacyCwds.has(key)) {
+    return;
+  }
+  migratedLegacyCwds.add(key);
   for (const source of legacyStateSources(cwd)) {
     const legacyState = readJsonObject(source.stateFile);
     if (!legacyState) {
@@ -378,6 +385,10 @@ function resolveCancelMarker(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${assertJobId(jobId)}${CANCEL_MARKER_SUFFIX}`);
 }
 
+function resolveCrashMarker(cwd, jobId) {
+  return path.join(resolveJobsDir(cwd), `${assertJobId(jobId)}${CRASH_MARKER_SUFFIX}`);
+}
+
 /**
  * Read one per-job record. The durable `<id>.cancelled` marker is authoritative:
  * if present it overlays `status:"cancelled"`, so a worker's in-flight
@@ -387,9 +398,24 @@ function resolveCancelMarker(cwd, jobId) {
 export function readJobFile(jobFile) {
   const parsed = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   if (parsed && typeof parsed === "object" && jobFile.endsWith(".json")) {
-    const marker = `${jobFile.slice(0, -".json".length)}${CANCEL_MARKER_SUFFIX}`;
-    if (fs.existsSync(marker)) {
+    const base = jobFile.slice(0, -".json".length);
+    const cancelMarker = `${base}${CANCEL_MARKER_SUFFIX}`;
+    if (fs.existsSync(cancelMarker)) {
       return { ...parsed, status: "cancelled" };
+    }
+    const crashMarker = `${base}${CRASH_MARKER_SUFFIX}`;
+    if ((parsed.status === "queued" || parsed.status === "running") && fs.existsSync(crashMarker)) {
+      const crashedAt = fs.readFileSync(crashMarker, "utf8").trim() || parsed.updatedAt;
+      return {
+        ...parsed,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        pidStartTime: null,
+        updatedAt: crashedAt,
+        completedAt: parsed.completedAt ?? crashedAt,
+        errorMessage: parsed.errorMessage ?? "Codex process exited without finalizing the job."
+      };
     }
   }
   return parsed;
@@ -461,6 +487,12 @@ export function writeCancelMarker(cwd, jobId) {
   writeFileAtomic(resolveCancelMarker(cwd, jobId), `${nowIso()}\n`);
 }
 
+/** Write the subordinate crash marker. A terminal job record always wins over it. */
+export function writeCrashMarker(cwd, jobId) {
+  ensureStateDir(cwd);
+  writeFileAtomic(resolveCrashMarker(cwd, jobId), `${nowIso()}\n`);
+}
+
 function removeFileIfExists(filePath) {
   if (!filePath) {
     return;
@@ -485,6 +517,7 @@ export function removeJob(cwd, jobId) {
   removeFileIfExists(jobFile);
   removeFileIfExists(path.join(jobsDir, `${jobId}.log`));
   removeFileIfExists(path.join(jobsDir, `${jobId}${CANCEL_MARKER_SUFFIX}`));
+  removeFileIfExists(path.join(jobsDir, `${jobId}${CRASH_MARKER_SUFFIX}`));
 }
 
 function isPidAlive(pid) {
@@ -528,27 +561,26 @@ export function sweepJobs(cwd, options = {}) {
       if (job.pidStartTime == null) {
         return true;
       }
-      return getProcessStartTimeImpl(job.pid) === job.pidStartTime;
+      const liveStartTime = getProcessStartTimeImpl(job.pid);
+      return liveStartTime == null || liveStartTime === job.pidStartTime;
     });
 
-  for (const job of listJobs(cwd)) {
+  const jobs = listJobs(cwd);
+  let wroteCrashMarker = false;
+  for (const job of jobs) {
     const active = job.status === "queued" || job.status === "running";
     if (!active) {
       continue;
     }
     const dead = job.pid != null ? !isJobAlive(job) : isStaleQueuedWithoutPid(job);
     if (dead) {
-      updateJobFile(cwd, job.id, {
-        status: "failed",
-        phase: "failed",
-        pid: null,
-        pidStartTime: null,
-        errorMessage: job.errorMessage ?? "Codex process exited without finalizing the job."
-      });
+      writeCrashMarker(cwd, job.id);
+      wroteCrashMarker = true;
     }
   }
 
-  const terminal = listJobs(cwd).filter((job) => job.status !== "queued" && job.status !== "running");
+  const terminalSource = wroteCrashMarker ? listJobs(cwd) : jobs;
+  const terminal = terminalSource.filter((job) => job.status !== "queued" && job.status !== "running");
   for (const job of terminal.slice(MAX_TERMINAL_JOBS)) {
     removeJob(cwd, job.id);
   }

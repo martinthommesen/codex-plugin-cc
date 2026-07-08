@@ -9,10 +9,6 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
 
-export function sortJobsNewestFirst(jobs) {
-  return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
-}
-
 // Single source of truth for "which session owns this job", used by the CLI,
 // the status/cancel readers, and the stop hook. Resolution precedence:
 // explicit id → hook input → an injected env → the ambient process env.
@@ -226,7 +222,7 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const allJobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const allJobs = filterJobsForCurrentSession(listJobs(workspaceRoot), options);
   // Stop-gate reviews are internal; hide them from the default view (visible with --all).
   const jobs = options.all ? allJobs : allJobs.filter((job) => job.jobClass !== "stop-review");
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
@@ -256,7 +252,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = listJobs(workspaceRoot);
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -270,9 +266,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(
-    reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot))
-  );
+  const jobs = reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot));
   const isFinished = (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled";
   // Bare `result` shows the latest task/review outcome. Advisor asks were answered inline, and
   // stop-gate reviews are internal — both stay reachable by explicit job id only.
@@ -304,7 +298,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = listJobs(workspaceRoot);
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {

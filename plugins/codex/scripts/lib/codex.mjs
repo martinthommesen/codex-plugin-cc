@@ -896,7 +896,7 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 // Fallback to DEFAULT_MODEL only when nobody chose: explicit --model wins without an RPC,
 // a Codex-config model (or any non-openai provider) wins by passing null so Codex-side
 // config layering stays authoritative.
-async function resolveEffectiveModel(
+export async function resolveEffectiveModel(
   client,
   cwd,
   requestedModel,

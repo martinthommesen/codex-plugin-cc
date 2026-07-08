@@ -4,11 +4,11 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { pathToFileURL } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { isMainEntrypoint } from "./lib/entrypoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const STDERR_TAIL_CHARS = 4000;
@@ -171,12 +171,15 @@ export function createBrokerSocketHandler(appClient, options = {}) {
 
     socket.on("data", async (chunk) => {
       buffer += chunk;
+      const lines = [];
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
-        const line = buffer.slice(0, newlineIndex);
+        lines.push(buffer.slice(0, newlineIndex));
         buffer = buffer.slice(newlineIndex + 1);
         newlineIndex = buffer.indexOf("\n");
+      }
 
+      for (const line of lines) {
         if (!line.trim()) {
           continue;
         }
@@ -318,15 +321,21 @@ async function main() {
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
-  let server;
-  let broker;
+  /** @type {net.Server | null} */
+  let server = null;
+  /** @type {ReturnType<typeof createBrokerSocketHandler> | null} */
+  let broker = null;
+  let finalizing = false;
 
   async function shutdown() {
-    for (const socket of broker.sockets) {
+    for (const socket of broker?.sockets ?? []) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    const activeServer = server;
+    if (activeServer?.listening) {
+      await new Promise((resolve) => activeServer.close(resolve));
+    }
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
     }
@@ -335,29 +344,39 @@ async function main() {
     }
   }
 
+  async function finalize(code) {
+    if (finalizing) {
+      return;
+    }
+    finalizing = true;
+    try {
+      await shutdown();
+    } finally {
+      process.exit(code);
+    }
+  }
+
   broker = createBrokerSocketHandler(appClient, {
-    shutdown,
-    exit: (code) => process.exit(code)
+    shutdown: () => finalize(0)
   });
 
   server = net.createServer((socket) => {
     broker.attach(socket);
   });
 
-  process.on("SIGTERM", async () => {
-    await shutdown();
-    process.exit(0);
+  process.on("SIGTERM", () => {
+    void finalize(0);
   });
 
-  process.on("SIGINT", async () => {
-    await shutdown();
-    process.exit(0);
+  process.on("SIGINT", () => {
+    void finalize(0);
   });
 
   server.listen(listenTarget.path);
+  appClient.exitPromise.then(() => finalize(1));
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainEntrypoint(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(1);

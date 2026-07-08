@@ -8,6 +8,9 @@ export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 /** Env var pointing at the plugin's per-workspace data directory. */
 export const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
+/** Env var overriding how long the client waits for a broker to become ready. */
+export const BROKER_READY_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_READY_TIMEOUT_MS";
+
 /**
  * Marker embedded in the stop-gate review prompt. The companion detects it to
  * classify the job as a stop-review; it MUST match the wording in
