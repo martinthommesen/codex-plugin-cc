@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
+import { isMainEntrypoint } from "./lib/entrypoint.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   isStopReviewGatePaused,
@@ -154,7 +155,7 @@ function main() {
   logNote(runningJobNote);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainEntrypoint(import.meta.url, process.argv[1])) {
   try {
     main();
   } catch (error) {

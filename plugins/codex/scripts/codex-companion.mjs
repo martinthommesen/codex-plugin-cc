@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { STOP_REVIEW_TASK_MARKER } from "./lib/constants.mjs";
+import { isMainEntrypoint } from "./lib/entrypoint.mjs";
 import {
   ADVISOR_THREAD_PREFIX,
   buildPersistentThreadName,
@@ -1188,7 +1189,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainEntrypoint(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${message}\n`);

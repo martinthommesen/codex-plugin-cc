@@ -1,13 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
 
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, run } from "./helpers.mjs";
 import {
   clearStopReviewGatePause,
   isStopReviewGatePaused,
   parseStopReviewOutput,
   pauseStopReviewGate
 } from "../plugins/codex/scripts/lib/stop-review.mjs";
+
+const COMPANION_SCRIPT = fileURLToPath(new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url));
+const STOP_HOOK_SCRIPT = fileURLToPath(new URL("../plugins/codex/scripts/stop-review-gate-hook.mjs", import.meta.url));
 
 test("parseStopReviewOutput allows ALLOW responses", () => {
   assert.deepEqual(parseStopReviewOutput("ALLOW: no issues found\nextra detail"), {
@@ -40,6 +47,22 @@ test("stop review hook module is import safe", async () => {
 
 test("codex companion module is import safe", async () => {
   await import("../plugins/codex/scripts/codex-companion.mjs");
+});
+
+test("symlinked entrypoints still run main", { skip: process.platform === "win32" }, () => {
+  const dir = makeTempDir();
+  const companionLink = path.join(dir, "codex-companion.mjs");
+  const stopHookLink = path.join(dir, "stop-review-gate-hook.mjs");
+  fs.symlinkSync(COMPANION_SCRIPT, companionLink);
+  fs.symlinkSync(STOP_HOOK_SCRIPT, stopHookLink);
+
+  const companion = run(process.execPath, [companionLink, "__entrypoint_probe__"]);
+  assert.equal(companion.status, 1);
+  assert.match(companion.stderr, /Unknown subcommand: __entrypoint_probe__/);
+
+  const stopHook = run(process.execPath, [stopHookLink], { input: "{" });
+  assert.equal(stopHook.status, 1);
+  assert.match(stopHook.stderr, /JSON/);
 });
 
 test("stop review gate pause markers are session scoped and clearable", () => {
