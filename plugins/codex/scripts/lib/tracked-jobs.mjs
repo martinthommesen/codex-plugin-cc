@@ -1,13 +1,17 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  currentPidNamespace,
+  nowIso,
+  readStoredJob,
+  resolveJobLogFile,
+  SESSION_ID_ENV,
+  upsertJob,
+  writeJobFile
+} from "./state.mjs";
 
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
-
-export function nowIso() {
-  return new Date().toISOString();
-}
+export { nowIso, SESSION_ID_ENV };
 
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -101,16 +105,10 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
 
     upsertJob(workspaceRoot, patch);
 
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
+    const storedJob = readStoredJob(workspaceRoot, jobId);
+    if (storedJob) {
+      writeJobFile(workspaceRoot, jobId, { ...storedJob, ...patch });
     }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
   };
 }
 
@@ -131,12 +129,16 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
+// The stored request (prompt included) is only read back from the job file, so keep
+// it out of the state.json index that every status poll loads and prints.
+export function indexRecord(record) {
+  const { request: _request, ...indexed } = record;
+  return indexed;
+}
+
+// /codex:cancel may have settled the job while this process was still running.
+function wasCancelled(job) {
+  return readStoredJob(job.workspaceRoot, job.id)?.status === "cancelled";
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
@@ -146,13 +148,17 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidNamespace: currentPidNamespace(),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  upsertJob(job.workspaceRoot, indexRecord(runningRecord));
 
   try {
     const execution = await runner();
+    if (wasCancelled(job)) {
+      return execution;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -180,7 +186,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    const existing = readStoredJob(job.workspaceRoot, job.id) ?? runningRecord;
+    if (existing.status === "cancelled") {
+      throw error;
+    }
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,

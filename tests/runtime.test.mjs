@@ -1,20 +1,35 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { buildEnv, installFakeCodex, readFakeCodexState } from "./fake-codex-fixture.mjs";
+import { initGitRepo, makeTempDir, run, takeCreatedTempDirs } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { readSessionPointer, removeSessionPointer, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+// Commands lazily start a detached shared broker per workspace, which normally lives
+// until Claude's SessionEnd. End each test's sessions so brokers and their fake
+// app-servers don't outlive the suite.
+afterEach(() => {
+  for (const dir of takeCreatedTempDirs()) {
+    if (!loadBrokerSession(dir)) {
+      continue;
+    }
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: dir,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: dir })
+    });
+  }
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -233,7 +248,7 @@ test("transfer delegates the current Claude session directly to native import", 
   assert.equal(payload.sourcePath, canonicalSourcePath);
   assert.equal(payload.sessionId, sessionId);
 
-  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  const fakeState = readFakeCodexState(binDir);
   assert.equal(fakeState.threads.length, 1);
   assert.equal(fakeState.threads[0].ephemeral, false);
   assert.equal(fakeState.threads[0].name, "Native transfer");
@@ -325,6 +340,119 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /only from .*\.claude.*projects/);
+});
+
+for (const [behavior, expectedError] of [
+  ["external-import-legacy", null],
+  ["external-import-before-response", null],
+  ["external-import-result-fails", /The transcript format is unsupported/],
+  ["external-import-unrelated", /The transcript format is unsupported/],
+  ["external-import-disconnect", /disconnected before completing the Claude session import/]
+]) {
+  test(`transfer handles ${behavior}`, () => {
+    const home = makeTempDir();
+    const binDir = makeTempDir();
+    const projectDir = path.join(home, ".claude", "projects", "project");
+    fs.mkdirSync(projectDir, { recursive: true });
+    const sourcePath = path.join(projectDir, "session.jsonl");
+    fs.writeFileSync(sourcePath, JSON.stringify({ type: "user", message: { content: "Continue this task" } }) + "\n");
+    installFakeCodex(binDir, behavior);
+    const result = run("node", [SCRIPT, "transfer", "--source", sourcePath, "--json"], {
+      cwd: home,
+      env: { ...buildEnv(binDir), HOME: home, CODEX_HOME: path.join(home, ".codex") },
+      timeout: 10000
+    });
+    assert.equal(result.error, undefined);
+    if (expectedError) {
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, expectedError);
+    } else {
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(JSON.parse(result.stdout).threadId, "thr_1");
+    }
+  });
+}
+
+for (const behavior of ["late-turn-failure", "late-turn-interrupted"]) {
+  test(`task preserves ${behavior} after receiving the final answer`, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    initGitRepo(repo);
+    installFakeCodex(binDir, behavior);
+    const result = run("node", [SCRIPT, "task", "--json", "check completion"], {
+      cwd: repo,
+      env: buildEnv(binDir),
+      timeout: 10000
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 1);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.status, 1);
+    assert.match(payload.error, behavior === "late-turn-failure" ? /Finalization hook failed/ : /interrupted/);
+    const stored = run("node", [SCRIPT, "result"], { cwd: repo, env: buildEnv(binDir) });
+    assert.match(stored.stdout, /Partial output:/);
+    assert.ok(stored.stdout.includes(payload.error));
+  });
+}
+
+test("task without subagents waits past the missing-completion grace period for a late failure", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  initGitRepo(repo);
+  installFakeCodex(binDir, "late-turn-failure-slow");
+  const result = run("node", [SCRIPT, "task", "--json", "check completion"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 15000
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /Finalization hook failed/);
+  assert.doesNotMatch(result.stderr, /Turn completion inferred/);
+});
+
+test("task accepts ultra and preserves a provider-specific model name", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  initGitRepo(repo);
+  installFakeCodex(binDir);
+  const result = run("node", [SCRIPT, "task", "--model", "custom/provider-model", "--effort", "ultra", "diagnose"], {
+    cwd: repo, env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const state = readFakeCodexState(binDir);
+  assert.equal(state.lastTurnStart.model, "custom/provider-model");
+  assert.equal(state.lastTurnStart.effort, "ultra");
+});
+
+test("the retired spark shortcut gives guidance before starting Codex", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "diagnose"], {
+    cwd: ROOT, env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /retired on September 14, 2026/);
+  assert.match(result.stderr, /Omit --model/);
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+});
+
+test("stop hook does not repeat a review while responding to stop-hook feedback", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "stop-gate-block");
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }));
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: JSON.stringify({ cwd: repo, stop_hook_active: true })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Skipping the Codex review gate/);
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
 });
 
 test("task reports the actual Codex auth error when the run is rejected", () => {
@@ -428,7 +556,7 @@ test("adversarial review asks Codex to inspect larger diffs itself", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  const state = readFakeCodexState(binDir);
   assert.match(state.lastTurnStart.prompt, /lightweight summary/i);
   assert.match(state.lastTurnStart.prompt, /read-only git commands/i);
   assert.doesNotMatch(state.lastTurnStart.prompt, /PROMPT_SELF_COLLECT_[ABC]/);
@@ -573,7 +701,6 @@ test("task-resume-candidate returns the latest rescue thread from the current se
 test("task --resume-last does not resume a task from another Claude session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -609,7 +736,7 @@ test("task --resume-last does not resume a task from another Claude session", ()
   assert.equal(resume.status, 1);
   assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
 
-  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const fakeState = readFakeCodexState(binDir);
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
   assert.equal(fakeState.lastTurnStart.prompt, "initial task");
 });
@@ -691,11 +818,44 @@ test("session start hook exports the Claude session id, transcript path, and plu
     })
   });
 
+  // The hook also records a session pointer; other tests reuse this id.
+  removeSessionPointer("sess-current");
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     fs.readFileSync(envFile, "utf8"),
     `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
   );
+});
+
+test("session hooks record and remove the plugin data dir for the live-status module", () => {
+  const repo = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const sessionId = `sess-pointer-${process.pid}-${Date.now()}`;
+  const hookEnv = { ...process.env, CLAUDE_PLUGIN_DATA: pluginDataDir };
+  delete hookEnv.CLAUDE_ENV_FILE;
+
+  const started = run("node", [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: hookEnv,
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: sessionId, cwd: repo })
+  });
+  assert.equal(started.status, 0, started.stderr);
+  assert.equal(readSessionPointer(sessionId), pluginDataDir);
+
+  // The module calls the companion with the session id alone, no CLAUDE_PLUGIN_DATA.
+  const moduleEnv = { ...process.env, CODEX_COMPANION_SESSION_ID: sessionId };
+  delete moduleEnv.CLAUDE_PLUGIN_DATA;
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: moduleEnv });
+  assert.equal(status.status, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout).running, []);
+
+  const ended = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: hookEnv,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: sessionId, cwd: repo })
+  });
+  assert.equal(ended.status, 0, ended.stderr);
+  assert.equal(readSessionPointer(sessionId), null);
 });
 
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
@@ -719,7 +879,6 @@ test("write task output focuses on the Codex result without generic follow-up hi
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -738,7 +897,7 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const fakeState = readFakeCodexState(binDir);
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
   assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
@@ -746,7 +905,6 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
 test("task --fresh is treated as routing control and does not leak into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -759,29 +917,28 @@ test("task --fresh is treated as routing control and does not leak into the prom
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const fakeState = readFakeCodexState(binDir);
   assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
 });
 
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir);
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "low", "diagnose the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-6.1-sol", "--effort", "max", "diagnose the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
-  assert.equal(fakeState.lastTurnStart.effort, "low");
+  const fakeState = readFakeCodexState(binDir);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6.1-sol");
+  assert.equal(fakeState.lastTurnStart.effort, "max");
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
@@ -872,22 +1029,45 @@ test("task ignores later subagent messages when choosing the final returned outp
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
+function runMissingParentCompletionTask(behavior) {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  installFakeCodex(binDir, "with-subagent-no-main-turn-completed");
+  installFakeCodex(binDir, behavior);
   initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
-    env: buildEnv(binDir)
+    env: buildEnv(binDir),
+    timeout: 15000
   });
+  assert.equal(result.error, undefined, "task should not hang when the parent turn/completed is missing");
+  return result;
+}
 
+test("task infers completion after subagent work when the server cannot report the missing parent turn", () => {
+  const result = runMissingParentCompletionTask("with-subagent-no-main-turn-completed");
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.match(result.stderr, /Turn completion inferred .*could not report the turn status/);
+});
+
+test("task uses the server-reported status when the parent turn/completed is missing", () => {
+  const result = runMissingParentCompletionTask("with-subagent-no-main-turn-completed-listed-failed");
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /Subagent finalization failed/);
+});
+
+test("task keeps waiting while the server reports the parent turn is still in progress", () => {
+  const result = runMissingParentCompletionTask("with-subagent-no-main-turn-completed-listed-in-progress");
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /Turn completion inferred/);
+  assert.match(result.stderr, /Turn completed\./);
+});
+
+test("task fails on disconnect after a final message without parent turn/completed", () => {
+  const result = runMissingParentCompletionTask("with-subagent-no-main-turn-completed-exit");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /disconnected before sending turn\/completed/);
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -941,7 +1121,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
 
   const waitedStatus = run(
     "node",
-    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"],
+    [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--poll-interval-ms", "100", "--json"],
     {
       cwd: repo,
       env: buildEnv(binDir)
@@ -1152,12 +1332,13 @@ test("status shows phases, hints, and the latest finished job", () => {
   assert.match(result.stdout, /Session runtime: direct startup/);
   assert.match(result.stdout, /Phase: reviewing/);
   assert.match(result.stdout, /Codex session ID: thr_1/);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_1/);
+  // Review threads are ephemeral, so no resume command is offered for them.
+  assert.doesNotMatch(result.stdout, /Resume in Codex: codex resume thr_1/);
   assert.match(result.stdout, /Thread ready \(thr_1\)\./);
   assert.match(result.stdout, /Reviewer started: current changes/);
   assert.match(result.stdout, /Duration: 1m 5s/);
   assert.match(result.stdout, /Codex session ID: thr_done/);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_done/);
+  assert.doesNotMatch(result.stdout, /Resume in Codex: codex resume thr_done/);
 });
 
 test("status without a job id only shows jobs from the current Claude session", () => {
@@ -1411,7 +1592,7 @@ test("result returns the stored output for the latest finished job by default", 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout,
-    "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\nResume in Codex: codex resume thr_review_finished\n"
+    "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\n"
   );
 });
 
@@ -1509,7 +1690,7 @@ test("result without a job id prefers the latest finished job from the current C
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout,
-    "Current session output.\n\nCodex session ID: thr_current\nResume in Codex: codex resume thr_current\n"
+    "Current session output.\n\nCodex session ID: thr_current\n"
   );
 });
 
@@ -2256,4 +2437,80 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+test("cancel stops a job whose process is not a process-group leader", async (t) => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  // Like a companion started by Claude's Bash tool: the shell leads the group, node does not.
+  const pidFile = path.join(workspace, "child.pid");
+  const shell = spawn(
+    "sh",
+    ["-c", `"${process.execPath}" -e "require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)" "${pidFile}"; true`],
+    { cwd: workspace, detached: true, stdio: "ignore" }
+  );
+  shell.unref();
+  t.after(() => {
+    try {
+      process.kill(-shell.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  const childPid = await waitFor(() => (fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8")) : null));
+  assert.notEqual(childPid, shell.pid);
+
+  const logFile = path.join(jobsDir, "review-fg.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(path.join(jobsDir, "review-fg.json"), JSON.stringify({ id: "review-fg", status: "running", logFile }), "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [{ id: "review-fg", status: "running", jobClass: "review", pid: childPid, logFile, updatedAt: "2026-03-18T15:30:02.000Z" }]
+    }),
+    "utf8"
+  );
+
+  const cancelResult = run("node", [SCRIPT, "cancel", "review-fg", "--json"], { cwd: workspace });
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+
+  await waitFor(() => {
+    try {
+      process.kill(childPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end keeps a shared broker that another Claude session still uses", () => {
+  const workspace = makeTempDir();
+  saveBrokerSession(workspace, {
+    endpoint: `unix:${path.join(workspace, "missing.sock")}`,
+    pidFile: null,
+    logFile: null,
+    sessionDir: null,
+    pid: null,
+    sessions: ["sess-a", "sess-b"]
+  });
+
+  const endA = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace, session_id: "sess-a" })
+  });
+  assert.equal(endA.status, 0, endA.stderr);
+  assert.deepEqual(loadBrokerSession(workspace)?.sessions, ["sess-b"]);
+
+  const endB = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace, session_id: "sess-b" })
+  });
+  assert.equal(endB.status, 0, endB.stderr);
+  assert.equal(loadBrokerSession(workspace), null);
 });

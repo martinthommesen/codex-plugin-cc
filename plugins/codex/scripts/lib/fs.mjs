@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
 export function ensureAbsolutePath(cwd, maybePath) {
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(cwd, maybePath);
@@ -14,12 +15,69 @@ export function readJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+// Several companion processes read these files while others write them, so write
+// a sibling temp file and rename it into place: readers never see a partial file.
 export function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tempPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  try {
+    renameWithRetry(tempPath, filePath);
+  } catch (error) {
+    fs.rmSync(tempPath, { force: true });
+    throw error;
+  }
 }
 
-export function safeReadFile(filePath) {
-  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+// Windows refuses to replace a file another process has open; retry briefly.
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= 20 || (error?.code !== "EPERM" && error?.code !== "EBUSY" && error?.code !== "EACCES")) {
+        throw error;
+      }
+      sleepSync(10);
+    }
+  }
+}
+
+// Holders keep a lock for a few milliseconds; an older lock was left by a killed process.
+const LOCK_STALE_MS = 2000;
+
+// Runs a synchronous read-modify-write while holding an exclusive lock file, so
+// concurrent companion and hook processes don't overwrite each other's updates.
+export function withFileLock(lockFile, fn) {
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        if (Date.now() - fs.statSync(lockFile).mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(lockFile, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      sleepSync(5 + Math.floor(Math.random() * 10));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lockFile, { force: true });
+  }
+}
+
+export function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function isProbablyText(buffer) {
@@ -30,6 +88,12 @@ export function isProbablyText(buffer) {
     }
   }
   return true;
+}
+
+// Hook payloads arrive as JSON on stdin; an empty payload means no fields.
+export function readJsonStdin() {
+  const raw = fs.readFileSync(0, "utf8").trim();
+  return raw ? JSON.parse(raw) : {};
 }
 
 export function readStdinIfPiped() {

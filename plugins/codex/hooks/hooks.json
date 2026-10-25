@@ -1,5 +1,5 @@
 {
-  "description": "Optional stop-time review gate for Codex Companion.",
+  "description": "Session lifecycle, the optional stop-time review gate, and live Codex job status.",
   "hooks": {
     "SessionStart": [
       {
@@ -34,5 +34,8 @@
         ]
       }
     ]
-  }
+  },
+  "modules": [
+    "./register.tsx"
+  ]
 }

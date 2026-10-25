@@ -19,8 +19,8 @@
  *   resolveCompletion: (state: TurnCaptureState) => void,
  *   rejectCompletion: (error: unknown) => void,
  *   finalTurn: Turn | null,
- *   completed: boolean,
  *   finalAnswerSeen: boolean,
+ *   sawSubagentWork: boolean,
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
@@ -28,9 +28,7 @@
  *   reviewText: string,
  *   reasoningSummary: string[],
  *   error: unknown,
- *   messages: Array<{ lifecycle: string, phase: string | null, text: string }>,
  *   fileChanges: ThreadItem[],
- *   commandExecutions: ThreadItem[],
  *   onProgress: ProgressReporter | null
  * }} TurnCaptureState
  */
@@ -50,6 +48,11 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+// How long the turn must stay quiet after the final answer and drained subagent
+// work before asking the server whether a missing turn/completed was dropped.
+const MISSING_TURN_COMPLETION_GRACE_MS = 3000;
+const CODEX_UNAVAILABLE_MESSAGE =
+  "Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.";
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -87,7 +90,7 @@ function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
-function shorten(text, limit = 72) {
+export function shorten(text, limit = 72) {
   const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
   if (!normalized) {
     return "";
@@ -98,7 +101,7 @@ function shorten(text, limit = 72) {
   return `${normalized.slice(0, limit - 3)}...`;
 }
 
-function looksLikeVerificationCommand(command) {
+export function looksLikeVerificationCommand(command) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
     command
   );
@@ -301,12 +304,7 @@ function describeCompletedItem(state, item) {
 
 /** @returns {TurnCaptureState} */
 function createTurnCaptureState(threadId, options = {}) {
-  let resolveCompletion;
-  let rejectCompletion;
-  const completion = new Promise((resolve, reject) => {
-    resolveCompletion = resolve;
-    rejectCompletion = reject;
-  });
+  const { promise: completion, resolve: resolveCompletion, reject: rejectCompletion } = Promise.withResolvers();
 
   return {
     threadId,
@@ -320,8 +318,8 @@ function createTurnCaptureState(threadId, options = {}) {
     resolveCompletion,
     rejectCompletion,
     finalTurn: null,
-    completed: false,
     finalAnswerSeen: false,
+    sawSubagentWork: false,
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
@@ -329,9 +327,7 @@ function createTurnCaptureState(threadId, options = {}) {
     reviewText: "",
     reasoningSummary: [],
     error: null,
-    messages: [],
     fileChanges: [],
-    commandExecutions: [],
     onProgress: options.onProgress ?? null
   };
 }
@@ -343,53 +339,88 @@ function clearCompletionTimer(state) {
   }
 }
 
-function completeTurn(state, turn = null, options = {}) {
-  if (state.completed) {
+function completeTurn(state, turn) {
+  if (state.finalTurn) {
     return;
   }
 
   clearCompletionTimer(state);
-  state.completed = true;
-
-  if (turn) {
-    state.finalTurn = turn;
-    if (!state.turnId) {
-      state.turnId = turn.id;
-    }
-  } else if (!state.finalTurn) {
-    state.finalTurn = {
-      id: state.turnId ?? "inferred-turn",
-      status: "completed"
-    };
-  }
-
-  if (options.inferred) {
-    emitProgress(state.onProgress, "Turn completion inferred after the main thread finished and subagent work drained.", "finalizing");
+  state.finalTurn = turn;
+  state.error = turn.error ?? state.error ?? null;
+  if (!state.turnId) {
+    state.turnId = turn.id;
   }
 
   state.resolveCompletion(state);
 }
 
-function scheduleInferredCompletion(state) {
-  if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
+function readyForMissingCompletionCheck(state) {
+  return (
+    !state.finalTurn &&
+    state.sawSubagentWork &&
+    state.finalAnswerSeen &&
+    state.pendingCollaborations.size === 0 &&
+    state.activeSubagentTurns.size === 0
+  );
+}
+
+/**
+ * Some Codex builds have dropped the parent turn/completed after subagent work,
+ * so this check only arms for turns that used subagents; other turns wait for
+ * turn/completed or fail on disconnect.
+ * A final message alone does not prove success (hooks, errors, or cancellation
+ * can follow it), so after a quiet period ask the server for the turn's status
+ * and only infer completion when the server cannot report it.
+ */
+async function checkMissingTurnCompletion(client, state) {
+  let turn = null;
+  let lookupFailed = false;
+  try {
+    const response = await client.request("thread/turns/list", {
+      threadId: state.threadId,
+      limit: 5,
+      itemsView: "notLoaded"
+    });
+    turn = response?.data?.find((candidate) => candidate.id === state.turnId) ?? null;
+  } catch {
+    // A dying connection also fails the lookup (the broker relays it as an RPC error
+    // before closing), so give the exit a moment to surface and leave it to rejectOnExit.
+    await Promise.race([client.exitPromise, new Promise((resolve) => setTimeout(resolve, 250))]);
+    if (client.exitResolved) {
+      return;
+    }
+    // Ephemeral threads and older Codex builds cannot list turns.
+    lookupFailed = true;
+  }
+  if (!readyForMissingCompletionCheck(state)) {
     return;
   }
 
-  if (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
-    return;
+  if (turn && turn.status !== "inProgress") {
+    emitProgress(state.onProgress, `Turn ${turn.status} (reported by thread/turns/list).`, "finalizing");
+    completeTurn(state, turn);
+  } else if (turn) {
+    scheduleMissingCompletionCheck(client, state);
+  } else {
+    emitProgress(
+      state.onProgress,
+      `Turn completion inferred after the main thread finished and subagent work drained${lookupFailed ? "; Codex could not report the turn status" : ""}.`,
+      "finalizing"
+    );
+    completeTurn(state, { id: state.turnId ?? "inferred-turn", status: "completed", items: [], error: null });
   }
+}
 
+// Debounced: every turn notification re-arms or cancels the check.
+function scheduleMissingCompletionCheck(client, state) {
   clearCompletionTimer(state);
+  if (!readyForMissingCompletionCheck(state)) {
+    return;
+  }
   state.completionTimer = setTimeout(() => {
     state.completionTimer = null;
-    if (state.completed || state.finalTurn || !state.finalAnswerSeen) {
-      return;
-    }
-    if (state.pendingCollaborations.size > 0 || state.activeSubagentTurns.size > 0) {
-      return;
-    }
-    completeTurn(state, null, { inferred: true });
-  }, 250);
+    void checkMissingTurnCompletion(client, state).catch((error) => state.rejectCompletion(error));
+  }, MISSING_TURN_COMPLETION_GRACE_MS);
   state.completionTimer.unref?.();
 }
 
@@ -398,6 +429,11 @@ function belongsToTurn(state, message) {
   if (!messageThreadId || !state.threadIds.has(messageThreadId)) {
     return false;
   }
+  // A subagent can run several turns (follow-up collab calls); each new turn
+  // re-pins its thread. Only the root thread is pinned to the captured turn.
+  if (message.method === "turn/started" && messageThreadId !== state.threadId) {
+    return true;
+  }
   const trackedTurnId = state.threadTurnIds.get(messageThreadId) ?? null;
   const messageTurnId = extractTurnId(message);
   return trackedTurnId === null || messageTurnId === null || messageTurnId === trackedTurnId;
@@ -405,12 +441,12 @@ function belongsToTurn(state, message) {
 
 function recordItem(state, item, lifecycle, threadId = null) {
   if (item.type === "collabAgentToolCall") {
+    state.sawSubagentWork = true;
     if (!threadId || threadId === state.threadId) {
       if (lifecycle === "started" || item.status === "inProgress") {
         state.pendingCollaborations.add(item.id);
       } else if (lifecycle === "completed") {
         state.pendingCollaborations.delete(item.id);
-        scheduleInferredCompletion(state);
       }
     }
     for (const receiverThreadId of item.receiverThreadIds ?? []) {
@@ -419,17 +455,11 @@ function recordItem(state, item, lifecycle, threadId = null) {
   }
 
   if (item.type === "agentMessage") {
-    state.messages.push({
-      lifecycle,
-      phase: item.phase ?? null,
-      text: item.text ?? ""
-    });
     if (item.text) {
       if (!threadId || threadId === state.threadId) {
         state.lastAgentMessage = item.text;
         if (lifecycle === "completed" && item.phase === "final_answer") {
           state.finalAnswerSeen = true;
-          scheduleInferredCompletion(state);
         }
       }
       if (lifecycle === "completed") {
@@ -479,11 +509,6 @@ function recordItem(state, item, lifecycle, threadId = null) {
 
   if (item.type === "fileChange" && lifecycle === "completed") {
     state.fileChanges.push(item);
-    return;
-  }
-
-  if (item.type === "commandExecution" && lifecycle === "completed") {
-    state.commandExecutions.push(item);
   }
 }
 
@@ -506,6 +531,7 @@ function applyTurnNotification(state, message) {
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
+        state.sawSubagentWork = true;
         state.activeSubagentTurns.add(message.params.threadId);
       }
       emitProgress(
@@ -535,13 +561,21 @@ function applyTurnNotification(state, message) {
       }
       break;
     case "error":
+      // Codex retries transient stream errors itself; those are not a failure yet.
+      if (message.params.willRetry) {
+        emitProgress(state.onProgress, `Codex error (retrying): ${message.params.error.message}`);
+        break;
+      }
+      if ((message.params.threadId ?? state.threadId) !== state.threadId) {
+        emitProgress(state.onProgress, `Subagent ${labelForThread(state, message.params.threadId)} error: ${message.params.error.message}`);
+        break;
+      }
       state.error = message.params.error;
       emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
       break;
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
-        scheduleInferredCompletion(state);
         break;
       }
       emitProgress(
@@ -554,6 +588,13 @@ function applyTurnNotification(state, message) {
     default:
       break;
   }
+}
+
+// Settles only by rejecting: once the app-server connection closes, pending work cannot finish.
+function rejectOnExit(client, message) {
+  return client.exitPromise.then(() => {
+    throw client.exitError ?? new Error(message);
+  });
 }
 
 async function captureTurn(client, threadId, startRequest, options = {}) {
@@ -572,13 +613,12 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
+      previousHandler?.(message);
+      return;
     }
 
     applyTurnNotification(state, message);
+    scheduleMissingCompletionCheck(client, state);
   });
 
   try {
@@ -589,12 +629,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      // Thread announcements carry no params.threadId; apply them as the live path does.
+      if (message.method === "thread/started" || message.method === "thread/name/updated" || belongsToTurn(state, message)) {
         applyTurnNotification(state, message);
       } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
+        previousHandler?.(message);
       }
     }
     state.bufferedNotifications.length = 0;
@@ -602,8 +641,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
     }
+    scheduleMissingCompletionCheck(client, state);
 
-    return await state.completion;
+    // An assistant's final message can precede hooks, errors, or cancellation.
+    // Wait for the server's terminal turn status (see checkMissingTurnCompletion).
+    return await Promise.race([
+      state.completion,
+      rejectOnExit(client, "Codex disconnected before sending turn/completed.")
+    ]);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -632,12 +677,7 @@ async function withAppServer(cwd, fn) {
       throw error;
     }
 
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
-    try {
-      return await fn(directClient);
-    } finally {
-      await directClient.close();
-    }
+    return withDirectAppServer(cwd, fn);
   }
 }
 
@@ -658,24 +698,29 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath) {
+function ledgerRecordsForSource(sourcePath) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
-    return null;
+    return [];
   }
   const ledger = readJsonFile(ledgerPath);
   const canonicalSource = fs.realpathSync(sourcePath);
-  const contentSha256 = sourceContentSha256(canonicalSource);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const match = records
-    .filter(
-      (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
-    )
-    .at(-1);
-  return match?.imported_thread_id ?? null;
+  return records.filter(
+    (record) => record?.source_path === canonicalSource && typeof record?.imported_thread_id === "string"
+  );
+}
+
+function importedThreadIdForSource(sourcePath, previousThreadIds = new Set()) {
+  const records = ledgerRecordsForSource(sourcePath);
+  const contentSha256 = sourceContentSha256(fs.realpathSync(sourcePath));
+  const match = records.filter((record) => record.content_sha256 === contentSha256).at(-1);
+  if (match) {
+    return match.imported_thread_id;
+  }
+  // The live Claude transcript can grow after Codex hashed it, so also accept a
+  // record for this source that appeared during the import.
+  return records.filter((record) => !previousThreadIds.has(record.imported_thread_id)).at(-1)?.imported_thread_id ?? null;
 }
 
 function externalAgentSessionMigration(sourcePath, cwd) {
@@ -700,29 +745,46 @@ function externalAgentSessionMigration(sourcePath, cwd) {
 
 async function requestExternalAgentSessionImport(client, params) {
   const previousHandler = client.notificationHandler;
-  let timeout = null;
-  let resolveCompleted;
-  let rejectCompleted;
-  const completed = new Promise((resolve, reject) => {
-    resolveCompleted = resolve;
-    rejectCompleted = reject;
-  });
+  let importId;
+  let requestCompleted = false;
+  const notifications = [];
+  const { promise: completed, resolve: resolveCompleted, reject: rejectCompleted } = /** @type {PromiseWithResolvers<void>} */ (Promise.withResolvers());
   void completed.catch(() => {});
+
+  function handleCompletion(result) {
+    if (importId && result.importId !== importId) return;
+    const failures = (result.itemTypeResults ?? []).flatMap((item) => item.failures ?? []);
+    if (failures.length) {
+      rejectCompleted(new Error(`Codex could not import the Claude session: ${failures.map((failure) => failure.message).join("; ")}`));
+    } else {
+      resolveCompleted();
+    }
+  }
 
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      if (requestCompleted) handleCompletion(message.params);
+      else notifications.push(message.params);
       return;
     }
     previousHandler?.(message);
   });
-  timeout = setTimeout(() => {
+  const timeout = setTimeout(() => {
     rejectCompleted(new Error("Timed out waiting for Codex to finish importing the Claude session."));
   }, EXTERNAL_AGENT_IMPORT_TIMEOUT_MS);
 
   try {
-    await client.request("externalAgentConfig/import", params);
-    await completed;
+    await Promise.race([
+      (async () => {
+        const response = await client.request("externalAgentConfig/import", params);
+        importId = response.importId;
+        requestCompleted = true;
+        for (const result of notifications) handleCompletion(result);
+        await completed;
+      })(),
+      completed,
+      rejectOnExit(client, "Codex disconnected before completing the Claude session import.")
+    ]);
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
@@ -875,6 +937,10 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 
     return buildAppServerAuthStatus(accountResponse, configResponse);
   } catch (error) {
+    // A busy shared broker says nothing about auth; let the caller retry directly.
+    if (error?.rpcCode === BROKER_BUSY_RPC_CODE) {
+      throw error;
+    }
     return buildAuthStatus({
       loggedIn: false,
       detail: error instanceof Error ? error.message : String(error),
@@ -883,7 +949,26 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+// Each probe spawns codex twice, and commands check both before and inside the
+// runtime call, so remember the answer for the life of the process.
+const codexAvailabilityByCwd = new Map();
+
 export function getCodexAvailability(cwd) {
+  let availability = codexAvailabilityByCwd.get(cwd);
+  if (!availability) {
+    availability = probeCodexAvailability(cwd);
+    codexAvailabilityByCwd.set(cwd, availability);
+  }
+  return availability;
+}
+
+export function ensureCodexAvailable(cwd) {
+  if (!getCodexAvailability(cwd).available) {
+    throw new Error(CODEX_UNAVAILABLE_MESSAGE);
+  }
+}
+
+function probeCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
     return versionStatus;
@@ -925,16 +1010,7 @@ export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) 
 export async function getCodexAuthStatus(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    return {
-      available: false,
-      loggedIn: false,
-      detail: availability.detail,
-      source: "availability",
-      authMethod: null,
-      verified: null,
-      requiresOpenaiAuth: null,
-      provider: null
-    };
+    return buildAuthStatus({ available: false, detail: availability.detail, source: "availability" });
   }
 
   let client = null;
@@ -943,7 +1019,16 @@ export async function getCodexAuthStatus(cwd, options = {}) {
       env: options.env,
       reuseExistingBroker: true
     });
-    return await getCodexAuthStatusFromClient(client, cwd);
+    try {
+      return await getCodexAuthStatusFromClient(client, cwd);
+    } catch (error) {
+      if (client.transport !== "broker" || error?.rpcCode !== BROKER_BUSY_RPC_CODE) {
+        throw error;
+      }
+      await client.close().catch(() => {});
+      client = await CodexAppServerClient.connect(cwd, { env: options.env, disableBroker: true });
+      return await getCodexAuthStatusFromClient(client, cwd);
+    }
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
@@ -1000,10 +1085,7 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
 }
 
 export async function runAppServerReview(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
+  ensureCodexAvailable(cwd);
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
@@ -1056,16 +1138,14 @@ export async function runAppServerReview(cwd, options = {}) {
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
+  ensureCodexAvailable(cwd);
   if (!options.sourcePath) {
     throw new Error("A Claude session source path is required.");
   }
 
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    const previousThreadIds = new Set(ledgerRecordsForSource(options.sourcePath).map((record) => record.imported_thread_id));
     try {
       await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
@@ -1077,7 +1157,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const threadId = importedThreadIdForSource(options.sourcePath, previousThreadIds);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
@@ -1093,10 +1173,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
 }
 
 export async function runAppServerTurn(cwd, options = {}) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
+  ensureCodexAvailable(cwd);
 
   return withAppServer(cwd, async (client) => {
     let threadId;
@@ -1105,8 +1182,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: false
+        sandbox: options.sandbox
       });
       threadId = response.thread.id;
     } else {
@@ -1114,8 +1190,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       const response = await startThread(client, cwd, {
         model: options.model,
         sandbox: options.sandbox,
-        ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
+        ephemeral: !options.persistThread,
+        threadName: options.threadName
       });
       threadId = response.thread.id;
     }
@@ -1152,18 +1228,13 @@ export async function runAppServerTurn(cwd, options = {}) {
       turn: turnState.finalTurn,
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr),
-      fileChanges: turnState.fileChanges,
-      touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      touchedFiles: collectTouchedFiles(turnState.fileChanges)
     };
   });
 }
 
 export async function findLatestTaskThread(cwd) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
-  }
+  ensureCodexAvailable(cwd);
 
   return withAppServer(cwd, async (client) => {
     const response = await client.request("thread/list", {
@@ -1189,7 +1260,7 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
       parsed: null,
-      parseError: fallback.failureMessage ?? "Codex did not return a final structured message.",
+      parseError: fallback.failureMessage || "Codex did not return a final structured message.",
       rawOutput: rawOutput ?? "",
       ...fallback
     };

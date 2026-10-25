@@ -1,8 +1,17 @@
 {
   "name": "codex",
-  "version": "1.0.6",
+  "version": "1.2.0",
   "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "OpenAI"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "systemNotifications": {
+      "type": "boolean",
+      "title": "System notifications",
+      "description": "In the terminal, send a system notification when a Codex job that ran 30 seconds or longer finishes or fails.",
+      "default": true
+    }
   }
 }

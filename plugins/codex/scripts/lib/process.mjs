@@ -7,7 +7,8 @@ export function runCommand(command, args = [], options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    maxBuffer: options.maxBuffer,
+    // Node's 1 MiB default is too small for git listings in large untracked trees.
+    maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
     stdio: options.stdio ?? "pipe",
     shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
     windowsHide: true
@@ -16,7 +17,8 @@ export function runCommand(command, args = [], options = {}) {
   return {
     command,
     args,
-    status: result.status ?? 0,
+    // null when the child was killed by a signal, so callers comparing against 0 fail closed.
+    status: result.status,
     signal: result.signal ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
@@ -44,7 +46,8 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
     return { available: false, detail: result.error.message };
   }
   if (result.status !== 0) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`;
+    const detail =
+      result.stderr.trim() || result.stdout.trim() || (result.signal ? `signal ${result.signal}` : `exit ${result.status}`);
     return { available: false, detail };
   }
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
@@ -64,17 +67,21 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
+    // taskkill is a native executable: running it through a POSIX shell such as Git Bash
+    // would rewrite its /PID-style switches into paths.
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
       return { attempted: true, delivered: true, method: "taskkill", result };
     }
 
+    // Exit 128 means the process was not found; the message text is localized.
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
+    if (!result.error && (result.status === 128 || looksLikeMissingProcessMessage(combinedOutput))) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 
@@ -100,20 +107,18 @@ export function terminateProcessTree(pid, options = {}) {
   try {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+  } catch {
+    // ESRCH here usually means the pid is alive but not a process-group leader
+    // (for example a companion started by a shell), so signal the pid itself.
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
       }
+      throw innerError;
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
   }
 }
 

@@ -3,17 +3,29 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { readJsonFile, withFileLock, writeJsonFile } from "./fs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+export const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
+const SESSION_POINTERS_DIR = path.join(FALLBACK_STATE_ROOT_DIR, "sessions");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const DEAD_PROCESS_MESSAGE = "The Codex companion process exited before the job finished.";
 
-function nowIso() {
+export function nowIso() {
   return new Date().toISOString();
+}
+
+export function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+export function sortJobsNewestFirst(jobs) {
+  return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
 function defaultState() {
@@ -24,6 +36,56 @@ function defaultState() {
     },
     jobs: []
   };
+}
+
+// Claude Code sets CLAUDE_PLUGIN_DATA for hooks and commands, but not for the
+// plugin's hooks module. SessionStart records the directory per session so the
+// module can reach the same state by passing only the session id.
+function resolveSessionPointerFile(sessionId) {
+  const digest = createHash("sha256").update(String(sessionId)).digest("hex").slice(0, 32);
+  return path.join(SESSION_POINTERS_DIR, `${digest}.json`);
+}
+
+export function writeSessionPointer(sessionId, pluginDataDir) {
+  if (!sessionId || !pluginDataDir || !path.isAbsolute(pluginDataDir)) {
+    return null;
+  }
+  fs.mkdirSync(SESSION_POINTERS_DIR, { recursive: true, mode: 0o700 });
+  const pointerFile = resolveSessionPointerFile(sessionId);
+  fs.writeFileSync(pointerFile, `${JSON.stringify({ pluginDataDir })}\n`, { encoding: "utf8", mode: 0o600 });
+  return pointerFile;
+}
+
+export function removeSessionPointer(sessionId) {
+  if (sessionId) {
+    fs.rmSync(resolveSessionPointerFile(sessionId), { force: true });
+  }
+}
+
+export function readSessionPointer(sessionId) {
+  if (!sessionId) {
+    return null;
+  }
+  const pointerFile = resolveSessionPointerFile(sessionId);
+  try {
+    const stat = fs.statSync(pointerFile);
+    // The fallback root can sit in a shared temp directory: trust only our own file.
+    // Windows has no POSIX owner or mode bits (every writable file reports 0o666).
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+      return null;
+    }
+    if (process.platform !== "win32" && (stat.mode & 0o022) !== 0) {
+      return null;
+    }
+    const { pluginDataDir } = readJsonFile(pointerFile);
+    return typeof pluginDataDir === "string" && path.isAbsolute(pluginDataDir) ? pluginDataDir : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolvePluginDataDir() {
+  return process.env[PLUGIN_DATA_ENV] || readSessionPointer(process.env[SESSION_ID_ENV]);
 }
 
 export function resolveStateDir(cwd) {
@@ -38,7 +100,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  const pluginDataDir = resolvePluginDataDir();
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);
 }
@@ -62,7 +124,7 @@ export function loadState(cwd) {
   }
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const parsed = readJsonFile(stateFile);
     return {
       ...defaultState(),
       ...parsed,
@@ -70,27 +132,69 @@ export function loadState(cwd) {
         ...defaultState().config,
         ...(parsed.config ?? {})
       },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs.map(settleDeadJob) : []
     };
   } catch {
     return defaultState();
   }
 }
 
-function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+let pidNamespace;
+
+// Pids are only comparable inside one PID namespace (Linux sandboxes may differ).
+export function currentPidNamespace() {
+  if (pidNamespace === undefined) {
+    try {
+      pidNamespace = fs.readlinkSync("/proc/self/ns/pid");
+    } catch {
+      pidNamespace = null;
+    }
+  }
+  return pidNamespace;
 }
 
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
   }
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+// A companion killed mid-run (Esc on its Bash call, a hook timeout, a crash) never
+// records completion, so report an active job whose process is gone as failed.
+function settleDeadJob(job) {
+  if (
+    !isActiveJob(job) ||
+    !Number.isInteger(job.pid) ||
+    job.pid <= 0 ||
+    (job.pidNamespace ?? null) !== currentPidNamespace() ||
+    isProcessAlive(job.pid)
+  ) {
+    return job;
+  }
+  return {
+    ...job,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage: job.errorMessage ?? DEAD_PROCESS_MESSAGE,
+    completedAt: job.completedAt ?? job.updatedAt ?? nowIso()
+  };
+}
+
+function pruneJobs(jobs) {
+  return sortJobsNewestFirst(jobs).slice(0, MAX_JOBS);
+}
+
+function removeFileIfExists(filePath) {
+  if (filePath) {
+    fs.rmSync(filePath, { force: true });
+  }
+}
+
+export function saveState(cwd, state, previousJobs = loadState(cwd).jobs) {
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
@@ -107,18 +211,24 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeJsonFile(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  ensureStateDir(cwd);
+  // Serializes read-modify-write cycles across companion processes, which would
+  // otherwise overwrite each other's job updates.
+  return withFileLock(`${resolveStateFile(cwd)}.lock`, () => {
+    const state = loadState(cwd);
+    const previousJobs = [...state.jobs];
+    mutate(state);
+    return saveState(cwd, state, previousJobs);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,18 +276,20 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeJsonFile(jobFile, payload);
   return jobFile;
 }
 
 export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  return readJsonFile(jobFile);
 }
 
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
+export function readStoredJob(workspaceRoot, jobId) {
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
   }
+  return readJobFile(jobFile);
 }
 
 export function resolveJobLogFile(cwd, jobId) {

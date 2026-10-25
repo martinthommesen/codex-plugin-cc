@@ -1,30 +1,23 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
+import { readJsonStdin } from "./lib/fs.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
-import { sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { isActiveJob, loadState } from "./lib/state.mjs";
+import { filterJobsForCurrentSession, sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Stay under the Stop hook's 900 s timeout (hooks.json) so a timeout still reports
+// a reason instead of Claude Code killing the hook first.
+const STOP_REVIEW_TIMEOUT_MS = 14 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
-
-function readHookInput() {
-  const raw = fs.readFileSync(0, "utf8").trim();
-  if (!raw) {
-    return {};
-  }
-  return JSON.parse(raw);
-}
 
 function emitDecision(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
@@ -35,14 +28,6 @@ function logNote(message) {
     return;
   }
   process.stderr.write(`${message}\n`);
-}
-
-function filterJobsForCurrentSession(jobs, input = {}) {
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
 }
 
 function buildStopReviewPrompt(input = {}) {
@@ -113,7 +98,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+        "The stop-time Codex review task timed out after 14 minutes. Run /codex:review --wait manually or bypass the gate."
     };
   }
 
@@ -140,13 +125,17 @@ function runStopReview(cwd, input = {}) {
 }
 
 function main() {
-  const input = readHookInput();
+  const input = readJsonStdin();
+  if (input.stop_hook_active) {
+    logNote("Skipping the Codex review gate while Claude is responding to stop-hook feedback.");
+    return;
+  }
   const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const config = getConfig(workspaceRoot);
+  const { config, jobs: allJobs } = loadState(workspaceRoot);
 
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
-  const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
+  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(allJobs, { sessionId: input.session_id }));
+  const runningJob = jobs.find(isActiveJob);
   const runningTaskNote = runningJob
     ? `Codex task ${runningJob.id} is still running. Check /codex:status and use /codex:cancel ${runningJob.id} if you want to stop it before ending the session.`
     : null;

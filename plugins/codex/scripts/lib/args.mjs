@@ -25,7 +25,11 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      // Split at the first "=" only: values such as paths may contain more.
+      const body = token.slice(2);
+      const equalsIndex = body.indexOf("=");
+      const rawKey = equalsIndex === -1 ? body : body.slice(0, equalsIndex);
+      const inlineValue = equalsIndex === -1 ? undefined : body.slice(equalsIndex + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -114,6 +118,12 @@ export function splitRawArgumentString(raw) {
     }
 
     current += character;
+  }
+
+  // An unmatched quote is almost always an apostrophe in prose ("don't"); quoting
+  // the rest of the string would swallow any flags after it, so split on whitespace.
+  if (quote) {
+    return raw.trim().split(/\s+/).filter(Boolean);
   }
 
   if (escaping) {

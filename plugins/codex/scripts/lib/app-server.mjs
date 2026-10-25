@@ -41,7 +41,10 @@ const DEFAULT_CAPABILITIES = {
   ]
 };
 
-function buildJsonRpcError(code, message, data) {
+// The shared broker lives for the whole Claude session; keep only recent stderr.
+const MAX_STDERR_CHARS = 64 * 1024;
+
+export function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
 }
 
@@ -68,9 +71,9 @@ class AppServerClientBase {
     this.lineBuffer = "";
     this.transport = "unknown";
 
-    this.exitPromise = new Promise((resolve) => {
-      this.resolveExit = resolve;
-    });
+    const exit = Promise.withResolvers();
+    this.exitPromise = exit.promise;
+    this.resolveExit = exit.resolve;
   }
 
   setNotificationHandler(handler) {
@@ -86,6 +89,10 @@ class AppServerClientBase {
   request(method, params) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
+    }
+    // After the transport is gone nothing would ever settle a new request.
+    if (this.exitResolved) {
+      return Promise.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
 
     const id = this.nextId;
@@ -105,14 +112,17 @@ class AppServerClientBase {
   }
 
   handleChunk(chunk) {
+    // Scan only the new chunk so large multi-chunk messages stay linear.
+    const searchFrom = this.lineBuffer.length;
     this.lineBuffer += chunk;
-    let newlineIndex = this.lineBuffer.indexOf("\n");
+    let lineStart = 0;
+    let newlineIndex = this.lineBuffer.indexOf("\n", searchFrom);
     while (newlineIndex !== -1) {
-      const line = this.lineBuffer.slice(0, newlineIndex);
-      this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
-      this.handleLine(line);
-      newlineIndex = this.lineBuffer.indexOf("\n");
+      this.handleLine(this.lineBuffer.slice(lineStart, newlineIndex));
+      lineStart = newlineIndex + 1;
+      newlineIndex = this.lineBuffer.indexOf("\n", lineStart);
     }
+    this.lineBuffer = this.lineBuffer.slice(lineStart);
   }
 
   handleLine(line) {
@@ -199,10 +209,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.stderr = (this.stderr + chunk).slice(-MAX_STDERR_CHARS);
     });
 
     this.proc.on("error", (error) => {
+      this.handleExit(error);
+    });
+
+    // A write racing the app-server's exit fails with EPIPE; without a listener
+    // that error would crash the companion instead of failing pending work.
+    this.proc.stdin.on("error", (error) => {
       this.handleExit(error);
     });
 
@@ -345,9 +361,21 @@ export class CodexAppServerClient {
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
+    if (brokerEndpoint) {
+      const brokerClient = new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint });
+      try {
+        await brokerClient.initialize();
+        return brokerClient;
+      } catch (error) {
+        // The recorded broker is gone (stale broker.json, or it shut down after the
+        // readiness probe): run this command on its own app-server instead.
+        if (error?.code !== "ENOENT" && error?.code !== "ECONNREFUSED") {
+          throw error;
+        }
+        await brokerClient.close().catch(() => {});
+      }
+    }
+    const client = new SpawnedCodexAppServerClient(cwd, options);
     await client.initialize();
     return client;
   }

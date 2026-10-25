@@ -1,27 +1,23 @@
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { createTempDir, readJsonFile, withFileLock, writeJsonFile } from "./fs.mjs";
+import { terminateProcessTree } from "./process.mjs";
+import { resolveStateDir, SESSION_ID_ENV } from "./state.mjs";
 
-export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
-export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
-
-export function createBrokerSessionDir(prefix = "cxc-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
+const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
 
 function connectToEndpoint(endpoint) {
   const target = parseBrokerEndpoint(endpoint);
   return net.createConnection({ path: target.path });
 }
 
-export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ready = await new Promise((resolve) => {
@@ -44,25 +40,28 @@ export async function sendBrokerShutdown(endpoint) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    // Don't let an unresponsive broker consume the SessionEnd hook's time budget.
+    socket.setTimeout(BROKER_SHUTDOWN_TIMEOUT_MS, () => socket.destroy());
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
       socket.end();
-      resolve();
+      resolve(undefined);
     });
     socket.on("error", resolve);
     socket.on("close", resolve);
   });
 }
 
-export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
+function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
   const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
     cwd,
     env,
     detached: true,
-    stdio: ["ignore", logFd, logFd]
+    stdio: ["ignore", logFd, logFd],
+    windowsHide: true
   });
   child.unref();
   fs.closeSync(logFd);
@@ -80,7 +79,7 @@ export function loadBrokerSession(cwd) {
   }
 
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return readJsonFile(stateFile);
   } catch {
     return null;
   }
@@ -89,14 +88,11 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  writeJsonFile(resolveBrokerStateFile(cwd), session);
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
-  }
+  fs.rmSync(resolveBrokerStateFile(cwd), { force: true });
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -110,25 +106,48 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+function sessionsOf(session) {
+  return Array.isArray(session?.sessions) ? session.sessions : [];
+}
+
+// Every change to the sessions list re-reads broker.json under a lock: callers
+// race (several companions start at once, SessionEnd runs alongside them), and a
+// list read before an await would drop sessions registered in the meantime.
+function updateBrokerSession(cwd, mutate) {
+  const stateDir = resolveStateDir(cwd);
+  fs.mkdirSync(stateDir, { recursive: true });
+  return withFileLock(`${resolveBrokerStateFile(cwd)}.lock`, () => mutate(loadBrokerSession(cwd)));
+}
+
+// The broker is shared by every Claude session in the workspace; record which
+// sessions use it so SessionEnd only shuts it down for the last one.
+function registerBrokerUser(cwd, session, sessionId) {
+  return updateBrokerSession(cwd, (current) => {
+    // Only extend the record for the broker we connected to.
+    const base = current?.endpoint === session.endpoint ? current : session;
+    const sessions = sessionsOf(base);
+    if (!sessionId || sessions.includes(sessionId)) {
+      return base;
+    }
+    const next = { ...base, sessions: [...sessions, sessionId] };
+    saveBrokerSession(cwd, next);
+    return next;
+  });
+}
+
 export async function ensureBrokerSession(cwd, options = {}) {
+  const sessionId = (options.env ?? process.env)[SESSION_ID_ENV] || null;
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    return existing;
+    return registerBrokerUser(cwd, existing, sessionId);
   }
 
   if (existing) {
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
+    teardownBrokerSession({ ...existing, killProcess: options.killProcess ?? null });
     clearBrokerSession(cwd);
   }
 
-  const sessionDir = createBrokerSessionDir();
+  const sessionDir = createTempDir("cxc-");
   const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
   const endpoint = endpointFactory(sessionDir, options.platform);
   const pidFile = path.join(sessionDir, "broker.pid");
@@ -146,28 +165,53 @@ export async function ensureBrokerSession(cwd, options = {}) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    return null;
-  }
-
-  const session = {
+  const spawned = {
     endpoint,
     pidFile,
     logFile,
     sessionDir,
     pid: child.pid ?? null
   };
-  saveBrokerSession(cwd, session);
-  return session;
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  if (!ready) {
+    // This broker is ours and unrecorded: stop it rather than leave it running.
+    teardownBrokerSession({ ...spawned, killProcess: options.killProcess ?? terminateProcessTree });
+    return null;
+  }
+
+  // Another companion may have started a broker for this workspace meanwhile; keep
+  // the recorded one so SessionEnd can reach every broker it has to stop.
+  const raced = loadBrokerSession(cwd);
+  if (raced?.endpoint && raced.endpoint !== endpoint && (await isBrokerEndpointReady(raced.endpoint))) {
+    await sendBrokerShutdown(endpoint);
+    teardownBrokerSession({ ...spawned, killProcess: options.killProcess ?? terminateProcessTree });
+    return registerBrokerUser(cwd, raced, sessionId);
+  }
+
+  return updateBrokerSession(cwd, (current) => {
+    // Keep sessions a concurrent caller already registered for this broker.
+    const sessions = current?.endpoint === endpoint ? sessionsOf(current) : [];
+    const session = { ...spawned, sessions: sessionId && !sessions.includes(sessionId) ? [...sessions, sessionId] : sessions };
+    saveBrokerSession(cwd, session);
+    return session;
+  });
+}
+
+// Returns the sessions other than `sessionId` still using the workspace broker.
+export function releaseBrokerSession(cwd, session, sessionId) {
+  if (!sessionId) {
+    return [];
+  }
+  return updateBrokerSession(cwd, (current) => {
+    // A record without an endpoint came from the environment, not broker.json.
+    const record = current?.endpoint && current.endpoint === session?.endpoint ? current : session;
+    const sessions = sessionsOf(record);
+    const remaining = sessions.filter((id) => id !== sessionId);
+    if (remaining.length > 0 && remaining.length !== sessions.length && record === current) {
+      saveBrokerSession(cwd, { ...current, sessions: remaining });
+    }
+    return remaining;
+  });
 }
 
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {
@@ -179,19 +223,17 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
-  }
-
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  for (const filePath of [pidFile, logFile]) {
+    if (filePath) {
+      fs.rmSync(filePath, { force: true });
+    }
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
-        fs.unlinkSync(target.path);
+      if (target.kind === "unix") {
+        fs.rmSync(target.path, { force: true });
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.

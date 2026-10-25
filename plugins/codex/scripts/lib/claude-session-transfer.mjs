@@ -5,7 +5,8 @@ import path from "node:path";
 import { ensureAbsolutePath } from "./fs.mjs";
 
 export const TRANSCRIPT_PATH_ENV = "CODEX_COMPANION_TRANSCRIPT_PATH";
-const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
+// Claude Code keeps transcripts under CLAUDE_CONFIG_DIR when it is set.
+const CLAUDE_PROJECTS_DIR = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "projects");
 
 function resolveUserPath(cwd, value) {
   if (value === "~") {

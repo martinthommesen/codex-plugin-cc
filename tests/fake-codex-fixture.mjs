@@ -313,7 +313,7 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6.1-sol", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -347,13 +347,29 @@ rl.on("line", (line) => {
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6.1-sol", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
       }
 
       case "externalAgentConfig/import": {
         if (BEHAVIOR === "external-import-unsupported") {
           send({ id: message.id, error: { code: -32601, message: "Unsupported method: externalAgentConfig/import" } });
+          break;
+        }
+        if (BEHAVIOR === "external-import-result-fails" || BEHAVIOR === "external-import-unrelated") {
+          send({ id: message.id, result: { importId: "import_1" } });
+          if (BEHAVIOR === "external-import-unrelated") {
+            send({ method: "externalAgentConfig/import/completed", params: { importId: "other", itemTypeResults: [] } });
+          }
+          setTimeout(() => send({ method: "externalAgentConfig/import/completed", params: {
+            importId: "import_1", itemTypeResults: [{ itemType: "SESSIONS", successes: [],
+              failures: [{ message: "The transcript format is unsupported" }] }]
+          } }), 50);
+          break;
+        }
+        if (BEHAVIOR === "external-import-disconnect") {
+          send({ id: message.id, result: { importId: "import_1" } });
+          setTimeout(() => process.exit(0), 50);
           break;
         }
         if (BEHAVIOR === "external-import-fails") {
@@ -399,8 +415,16 @@ rl.on("line", (line) => {
           saveState(state);
           saveImportLedger(ledger);
         }
-        send({ id: message.id, result: {} });
-        send({ method: "externalAgentConfig/import/completed", params: {} });
+        const response = { id: message.id, result: BEHAVIOR === "external-import-legacy" ? {} : { importId: "import_1" } };
+        const completion = { method: "externalAgentConfig/import/completed", params:
+          BEHAVIOR === "external-import-legacy" ? {} : { importId: "import_1", itemTypeResults: [] } };
+        if (BEHAVIOR === "external-import-before-response") {
+          send(completion);
+          send(response);
+        } else {
+          send(response);
+          send(completion);
+        }
         break;
       }
 
@@ -461,7 +485,7 @@ rl.on("line", (line) => {
         if (
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
-          BEHAVIOR === "with-subagent-no-main-turn-completed"
+          BEHAVIOR.startsWith("with-subagent-no-main-turn-completed")
         ) {
           const subThread = nextThread(state, thread.cwd, true);
           const subThreadRecord = ensureThread(state, subThread.id);
@@ -561,9 +585,22 @@ rl.on("line", (line) => {
               }
             });
           }
-          if (BEHAVIOR !== "with-subagent-no-main-turn-completed") {
+          if (!BEHAVIOR.startsWith("with-subagent-no-main-turn-completed")) {
             send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          } else if (BEHAVIOR === "with-subagent-no-main-turn-completed-exit") {
+            setTimeout(() => process.exit(0), 600);
           }
+          break;
+        }
+
+        if (BEHAVIOR === "late-turn-failure" || BEHAVIOR === "late-turn-failure-slow" || BEHAVIOR === "late-turn-interrupted") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "item/completed", params: { threadId: thread.id, turnId,
+            item: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" } } });
+          setTimeout(() => send({ method: "turn/completed", params: { threadId: thread.id,
+            turn: buildTurn(turnId, BEHAVIOR === "late-turn-interrupted" ? "interrupted" : "failed",
+              BEHAVIOR === "late-turn-interrupted" ? null : { message: "Finalization hook failed" }) } }),
+            BEHAVIOR === "late-turn-failure-slow" ? 4500 : 600);
           break;
         }
 
@@ -604,6 +641,19 @@ rl.on("line", (line) => {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
+	        }
+	        break;
+	      }
+
+	      case "thread/turns/list": {
+	        const turnId = state.lastTurnStart && state.lastTurnStart.turnId;
+	        if (BEHAVIOR === "with-subagent-no-main-turn-completed-listed-failed") {
+	          send({ id: message.id, result: { data: [buildTurn(turnId, "failed", { message: "Subagent finalization failed" })], nextCursor: null, backwardsCursor: null } });
+	        } else if (BEHAVIOR === "with-subagent-no-main-turn-completed-listed-in-progress") {
+	          send({ id: message.id, result: { data: [buildTurn(turnId)], nextCursor: null, backwardsCursor: null } });
+	          setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: buildTurn(turnId, "completed") } }), 200);
+	        } else {
+	          send({ id: message.id, error: { code: -32600, message: "ephemeral threads do not support thread/turns/list" } });
 	        }
 	        break;
 	      }
@@ -650,9 +700,12 @@ rl.on("line", (line) => {
 }
 
 export function buildEnv(binDir) {
-  const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${path.delimiter}${process.env.PATH}`
   };
+}
+
+export function readFakeCodexState(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
 }
