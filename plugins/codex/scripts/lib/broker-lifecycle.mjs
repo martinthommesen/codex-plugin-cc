@@ -1,27 +1,22 @@
 import fs from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { createTempDir, readJsonFile, writeJsonFile } from "./fs.mjs";
 import { resolveStateDir } from "./state.mjs";
 
-export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
-export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 const BROKER_STATE_FILE = "broker.json";
-
-export function createBrokerSessionDir(prefix = "cxc-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
+const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
 
 function connectToEndpoint(endpoint) {
   const target = parseBrokerEndpoint(endpoint);
   return net.createConnection({ path: target.path });
 }
 
-export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const ready = await new Promise((resolve) => {
@@ -44,19 +39,21 @@ export async function sendBrokerShutdown(endpoint) {
   await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     socket.setEncoding("utf8");
+    // Don't let an unresponsive broker consume the SessionEnd hook's time budget.
+    socket.setTimeout(BROKER_SHUTDOWN_TIMEOUT_MS, () => socket.destroy());
     socket.on("connect", () => {
       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
     });
     socket.on("data", () => {
       socket.end();
-      resolve();
+      resolve(undefined);
     });
     socket.on("error", resolve);
     socket.on("close", resolve);
   });
 }
 
-export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
+function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
   const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
     cwd,
@@ -80,7 +77,7 @@ export function loadBrokerSession(cwd) {
   }
 
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return readJsonFile(stateFile);
   } catch {
     return null;
   }
@@ -89,14 +86,11 @@ export function loadBrokerSession(cwd) {
 export function saveBrokerSession(cwd, session) {
   const stateDir = resolveStateDir(cwd);
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(resolveBrokerStateFile(cwd), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+  writeJsonFile(resolveBrokerStateFile(cwd), session);
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
-  if (fs.existsSync(stateFile)) {
-    fs.unlinkSync(stateFile);
-  }
+  fs.rmSync(resolveBrokerStateFile(cwd), { force: true });
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -117,18 +111,11 @@ export async function ensureBrokerSession(cwd, options = {}) {
   }
 
   if (existing) {
-    teardownBrokerSession({
-      endpoint: existing.endpoint ?? null,
-      pidFile: existing.pidFile ?? null,
-      logFile: existing.logFile ?? null,
-      sessionDir: existing.sessionDir ?? null,
-      pid: existing.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
+    teardownBrokerSession({ ...existing, killProcess: options.killProcess ?? null });
     clearBrokerSession(cwd);
   }
 
-  const sessionDir = createBrokerSessionDir();
+  const sessionDir = createTempDir("cxc-");
   const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
   const endpoint = endpointFactory(sessionDir, options.platform);
   const pidFile = path.join(sessionDir, "broker.pid");
@@ -179,19 +166,17 @@ export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessi
     }
   }
 
-  if (pidFile && fs.existsSync(pidFile)) {
-    fs.unlinkSync(pidFile);
-  }
-
-  if (logFile && fs.existsSync(logFile)) {
-    fs.unlinkSync(logFile);
+  for (const filePath of [pidFile, logFile]) {
+    if (filePath) {
+      fs.rmSync(filePath, { force: true });
+    }
   }
 
   if (endpoint) {
     try {
       const target = parseBrokerEndpoint(endpoint);
-      if (target.kind === "unix" && fs.existsSync(target.path)) {
-        fs.unlinkSync(target.path);
+      if (target.kind === "unix") {
+        fs.rmSync(target.path, { force: true });
       }
     } catch {
       // Ignore malformed or already-removed broker endpoints during teardown.

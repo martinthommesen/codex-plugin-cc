@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, buildJsonRpcError, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -20,10 +20,6 @@ function buildStreamThreadIds(method, params, result) {
     threadIds.add(result.reviewThreadId);
   }
   return threadIds;
-}
-
-function buildJsonRpcError(code, message, data) {
-  return data === undefined ? { code, message } : { code, message, data };
 }
 
 function send(socket, message) {
@@ -99,18 +95,23 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
-    }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
-    }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+  // Idempotent: a signal, broker/shutdown, and the runtime exiting can all trigger it.
+  let shutdownPromise = null;
+  function shutdown(server) {
+    shutdownPromise ??= (async () => {
+      for (const socket of sockets) {
+        socket.end();
+      }
+      await appClient.close().catch(() => {});
+      await new Promise((resolve) => server.close(resolve));
+      if (listenTarget.kind === "unix") {
+        fs.rmSync(listenTarget.path, { force: true });
+      }
+      if (pidFile) {
+        fs.rmSync(pidFile, { force: true });
+      }
+    })();
+    return shutdownPromise;
   }
 
   appClient.setNotificationHandler(routeNotification);
@@ -222,26 +223,31 @@ async function main() {
       }
     });
 
-    socket.on("close", () => {
+    const forgetSocket = () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
-    });
-
-    socket.on("error", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
-    });
+    };
+    socket.on("close", forgetSocket);
+    socket.on("error", forgetSocket);
   });
 
-  process.on("SIGTERM", async () => {
+  // Do not leave clients waiting forever if the underlying runtime exits.
+  void appClient.exitPromise.then(async () => {
+    if (!shutdownPromise) {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+    }
     await shutdown(server);
     process.exit(0);
   });
 
-  process.on("SIGINT", async () => {
-    await shutdown(server);
-    process.exit(0);
-  });
+  for (const signal of ["SIGTERM", "SIGINT"]) {
+    process.on(signal, async () => {
+      await shutdown(server);
+      process.exit(0);
+    });
+  }
 
   server.listen(listenTarget.path);
 }

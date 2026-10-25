@@ -17,7 +17,9 @@ they already have.
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
+- **Node.js 22 or later** (Node.js 24 LTS recommended)
+- **A current Codex CLI**. This release is validated against Codex 0.164.0.
+- **Claude Code with plugin support**. Manifest validation was checked with Claude Code 2.1.310.
 
 ## Install
 
@@ -71,6 +73,35 @@ One simple first run is:
 /codex:status
 /codex:result
 ```
+
+## Update an existing installation
+
+Update Codex and refresh the plugin from your configured marketplace:
+
+```bash
+npm install -g @openai/codex@latest
+claude plugin marketplace update openai-codex
+claude plugin update codex@openai-codex
+```
+
+Then run `/reload-plugins` and `/codex:setup` inside Claude Code. Updating the
+marketplace installs its published version; to try this checkout's changes, start
+Claude Code with `claude --plugin-dir ./plugins/codex` from the repository root.
+
+Several models have retired from Codex with ChatGPT sign-in. If your Codex config,
+a `--model` flag, or a saved prompt still names one, switch to its replacement:
+
+| Retired model | Retired | Replacement |
+| --- | --- | --- |
+| `gpt-5.4` | August 31, 2026 | `gpt-6-sol` |
+| `gpt-5.4-mini` | August 31, 2026 | `gpt-6-luna` |
+| `gpt-5.3-codex-spark` (the `spark` shortcut) | September 14, 2026 | none; omit `--model` or pick one with Codex `/model` |
+| `gpt-5.5` | October 14, 2026 | `gpt-6.1-sol` on paid plans, `gpt-6-luna` on Free and Go |
+
+The GPT-5.4 and GPT-5.5 retirements do not affect API-key sessions. Current examples below use
+GPT-6.1 Sol and GPT-6 Luna when available to your account. Explicit model names are
+passed through, including custom provider models; the plugin leaves the model and
+effort unset by default. See the [current model guidance](https://learn.chatgpt.com/docs/models).
 
 ## Usage
 
@@ -145,8 +176,8 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
+/codex:rescue --model gpt-6-luna --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-6.1-sol --effort high investigate the regression
 /codex:rescue --background investigate the regression
 ```
 
@@ -159,7 +190,9 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- model availability and supported efforts depend on your account, provider, and Codex version; use Codex `/model` to see available choices
+- `--effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; Codex validates support for the selected model
+- the retired `spark` shortcut now returns guidance instead of selecting GPT-5.3-Codex-Spark
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`
@@ -234,7 +267,7 @@ You can also use `/codex:setup` to manage the optional review gate.
 When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
 
 > [!WARNING]
-> The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
+> The review gate uses additional Codex capacity on each normal stop. It skips repeat stops while Claude is responding to stop-hook feedback to avoid a review loop.
 
 ## Typical Flows
 
@@ -270,10 +303,10 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-6-luna` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
-model = "gpt-5.4-mini"
+model = "gpt-6-luna"
 model_reasoning_effort = "high"
 ```
 
@@ -318,3 +351,27 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Development and compatibility
+
+```bash
+npm ci
+npm run check-version
+npm test
+npm run build
+claude plugin validate plugins/codex
+claude plugin validate .
+```
+
+The development dependency pins Codex 0.164.0 so protocol type generation and
+native import tests are reproducible. Installed plugins continue to use the
+user's global Codex CLI. CI tests Node.js 22, 24, and 26. The runtime suite covers
+reviews, tasks, cancellation, shared brokers, transfer, and lifecycle hooks;
+native tests use synthetic transcripts in an isolated home without model inference.
+
+Compatibility was researched on October 25, 2026 against the
+[Codex app-server protocol](https://learn.chatgpt.com/docs/app-server),
+[Codex models](https://learn.chatgpt.com/docs/models),
+[Claude Code plugin manifest](https://code.claude.com/docs/en/plugins-reference),
+[Claude Code hooks](https://code.claude.com/docs/en/hooks), and
+[Node.js release support](https://nodejs.org/en/about/previous-releases).

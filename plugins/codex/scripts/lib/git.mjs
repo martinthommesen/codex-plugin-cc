@@ -21,18 +21,10 @@ function listUniqueFiles(...groups) {
   return [...new Set(groups.flat().filter(Boolean))].sort();
 }
 
-function normalizeMaxInlineFiles(value) {
+function normalizeLimit(value, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
-    return DEFAULT_INLINE_DIFF_MAX_FILES;
-  }
-  return Math.floor(parsed);
-}
-
-function normalizeMaxInlineDiffBytes(value) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return DEFAULT_INLINE_DIFF_MAX_BYTES;
+    return fallback;
   }
   return Math.floor(parsed);
 }
@@ -137,7 +129,6 @@ export function resolveReviewTarget(cwd, options = {}) {
 
   const requestedScope = options.scope ?? "auto";
   const baseRef = options.base ?? null;
-  const state = getWorkingTreeState(cwd);
   const supportedScopes = new Set(["auto", "working-tree", "branch"]);
 
   if (baseRef) {
@@ -173,7 +164,7 @@ export function resolveReviewTarget(cwd, options = {}) {
     };
   }
 
-  if (state.isDirty) {
+  if (getWorkingTreeState(cwd).isDirty) {
     return {
       mode: "working-tree",
       label: "working tree diff",
@@ -300,8 +291,8 @@ function buildAdversarialCollectionGuidance(options = {}) {
 export function collectReviewContext(cwd, target, options = {}) {
   const repoRoot = getRepoRoot(cwd);
   const currentBranch = getCurrentBranch(repoRoot);
-  const maxInlineFiles = normalizeMaxInlineFiles(options.maxInlineFiles);
-  const maxInlineDiffBytes = normalizeMaxInlineDiffBytes(options.maxInlineDiffBytes);
+  const maxInlineFiles = normalizeLimit(options.maxInlineFiles, DEFAULT_INLINE_DIFF_MAX_FILES);
+  const maxInlineDiffBytes = normalizeLimit(options.maxInlineDiffBytes, DEFAULT_INLINE_DIFF_MAX_BYTES);
   let details;
   let includeDiff;
   let diffBytes;

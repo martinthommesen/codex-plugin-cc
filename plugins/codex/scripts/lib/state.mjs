@@ -3,17 +3,26 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { readJsonFile, writeJsonFile } from "./fs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
-const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+export const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 
-function nowIso() {
+export function nowIso() {
   return new Date().toISOString();
+}
+
+export function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+export function sortJobsNewestFirst(jobs) {
+  return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
 function defaultState() {
@@ -62,7 +71,7 @@ export function loadState(cwd) {
   }
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const parsed = readJsonFile(stateFile);
     return {
       ...defaultState(),
       ...parsed,
@@ -78,19 +87,16 @@ export function loadState(cwd) {
 }
 
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  return sortJobsNewestFirst(jobs).slice(0, MAX_JOBS);
 }
 
 function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
+  if (filePath) {
+    fs.rmSync(filePath, { force: true });
   }
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+export function saveState(cwd, state, previousJobs = loadState(cwd).jobs) {
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
@@ -107,18 +113,19 @@ export function saveState(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
+    removeFileIfExists(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeJsonFile(resolveStateFile(cwd), nextState);
   return nextState;
 }
 
 export function updateState(cwd, mutate) {
   const state = loadState(cwd);
+  const previousJobs = [...state.jobs];
   mutate(state);
-  return saveState(cwd, state);
+  return saveState(cwd, state, previousJobs);
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,18 +173,20 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeJsonFile(jobFile, payload);
   return jobFile;
 }
 
 export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  return readJsonFile(jobFile);
 }
 
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
+export function readStoredJob(workspaceRoot, jobId) {
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
   }
+  return readJobFile(jobFile);
 }
 
 export function resolveJobLogFile(cwd, jobId) {

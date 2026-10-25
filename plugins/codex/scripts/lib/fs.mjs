@@ -18,10 +18,6 @@ export function writeJsonFile(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-export function safeReadFile(filePath) {
-  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
-}
-
 export function isProbablyText(buffer) {
   const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
   for (const value of sample) {
@@ -30,6 +26,12 @@ export function isProbablyText(buffer) {
     }
   }
   return true;
+}
+
+// Hook payloads arrive as JSON on stdin; an empty payload means no fields.
+export function readJsonStdin() {
+  const raw = fs.readFileSync(0, "utf8").trim();
+  return raw ? JSON.parse(raw) : {};
 }
 
 export function readStdinIfPiped() {

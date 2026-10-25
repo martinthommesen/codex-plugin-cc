@@ -15,11 +15,11 @@ import type {
   ThreadItem,
   ThreadListParams,
   ThreadListResponse,
-  ThreadResumeParams as RawThreadResumeParams,
+  ThreadResumeParams,
   ThreadResumeResponse,
   ThreadSetNameParams,
   ThreadSetNameResponse,
-  ThreadStartParams as RawThreadStartParams,
+  ThreadStartParams,
   ThreadStartResponse,
   Turn,
   TurnInterruptParams,
@@ -38,14 +38,13 @@ export type {
   Thread,
   ThreadItem,
   ThreadListParams,
+  ThreadResumeParams,
+  ThreadStartParams,
   Turn,
   TurnInterruptParams,
   TurnStartParams,
   UserInput
 };
-
-export type ThreadStartParams = Omit<RawThreadStartParams, "persistExtendedHistory">;
-export type ThreadResumeParams = Omit<RawThreadResumeParams, "persistExtendedHistory">;
 
 export interface CodexAppServerClientOptions {
   env?: NodeJS.ProcessEnv;

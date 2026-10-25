@@ -1,13 +1,10 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { nowIso, readStoredJob, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
+export { nowIso };
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
-
-export function nowIso() {
-  return new Date().toISOString();
-}
 
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -101,16 +98,10 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
 
     upsertJob(workspaceRoot, patch);
 
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
+    const storedJob = readStoredJob(workspaceRoot, jobId);
+    if (storedJob) {
+      writeJobFile(workspaceRoot, jobId, { ...storedJob, ...patch });
     }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
   };
 }
 
@@ -129,14 +120,6 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     appendLogBlock(logFile, event.logTitle, event.logBody);
     onEvent?.(event);
   };
-}
-
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
@@ -180,7 +163,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    const existing = readStoredJob(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,

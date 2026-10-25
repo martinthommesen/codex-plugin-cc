@@ -41,7 +41,10 @@ const DEFAULT_CAPABILITIES = {
   ]
 };
 
-function buildJsonRpcError(code, message, data) {
+// The shared broker lives for the whole Claude session; keep only recent stderr.
+const MAX_STDERR_CHARS = 64 * 1024;
+
+export function buildJsonRpcError(code, message, data) {
   return data === undefined ? { code, message } : { code, message, data };
 }
 
@@ -68,9 +71,9 @@ class AppServerClientBase {
     this.lineBuffer = "";
     this.transport = "unknown";
 
-    this.exitPromise = new Promise((resolve) => {
-      this.resolveExit = resolve;
-    });
+    const exit = Promise.withResolvers();
+    this.exitPromise = exit.promise;
+    this.resolveExit = exit.resolve;
   }
 
   setNotificationHandler(handler) {
@@ -105,14 +108,17 @@ class AppServerClientBase {
   }
 
   handleChunk(chunk) {
+    // Scan only the new chunk so large multi-chunk messages stay linear.
+    const searchFrom = this.lineBuffer.length;
     this.lineBuffer += chunk;
-    let newlineIndex = this.lineBuffer.indexOf("\n");
+    let lineStart = 0;
+    let newlineIndex = this.lineBuffer.indexOf("\n", searchFrom);
     while (newlineIndex !== -1) {
-      const line = this.lineBuffer.slice(0, newlineIndex);
-      this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
-      this.handleLine(line);
-      newlineIndex = this.lineBuffer.indexOf("\n");
+      this.handleLine(this.lineBuffer.slice(lineStart, newlineIndex));
+      lineStart = newlineIndex + 1;
+      newlineIndex = this.lineBuffer.indexOf("\n", lineStart);
     }
+    this.lineBuffer = this.lineBuffer.slice(lineStart);
   }
 
   handleLine(line) {
@@ -199,7 +205,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.setEncoding("utf8");
 
     this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
+      this.stderr = (this.stderr + chunk).slice(-MAX_STDERR_CHARS);
     });
 
     this.proc.on("error", (error) => {

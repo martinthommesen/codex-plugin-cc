@@ -1,3 +1,5 @@
+import { isActiveJob } from "./state.mjs";
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -99,11 +101,15 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
-function formatCodexResumeCommand(job) {
+export function formatCodexResumeCommand(job) {
   if (!job?.threadId) {
     return null;
   }
   return `codex resume ${job.threadId}`;
+}
+
+function ensureTrailingNewline(text) {
+  return text.endsWith("\n") ? text : `${text}\n`;
 }
 
 function appendActiveJobsTable(lines, jobs) {
@@ -112,7 +118,7 @@ function appendActiveJobsTable(lines, jobs) {
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
-    if (job.status === "queued" || job.status === "running") {
+    if (isActiveJob(job)) {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
@@ -145,13 +151,13 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
   }
-  if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
+  if (isActiveJob(job) && options.showCancelHint) {
     lines.push(`  Cancel: /codex:cancel ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
+  if (!isActiveJob(job) && options.showResultHint) {
     lines.push(`  Result: /codex:result ${job.id}`);
   }
-  if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
+  if (!isActiveJob(job) && job.jobClass === "task" && job.write && options.showReviewHint) {
     lines.push("  Review changes: /codex:review --wait");
     lines.push("  Stricter review: /codex:adversarial-review --wait");
   }
@@ -312,14 +318,12 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderTaskResult(parsedResult, meta) {
-  const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+export function renderTaskResult({ status, rawOutput, failureMessage }) {
+  if (status !== 0) {
+    const error = String(failureMessage || "Codex did not complete the task.").trim();
+    return `${error}\n${rawOutput ? `\nPartial output:\n${rawOutput.trimEnd()}\n` : ""}`;
   }
-
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return `${message}\n`;
+  return rawOutput ? ensureTrailingNewline(rawOutput) : "Codex did not return a final message.\n";
 }
 
 export function renderStatusReport(report) {
@@ -377,8 +381,8 @@ export function renderStatusReport(report) {
 export function renderJobStatusReport(job) {
   const lines = ["# Codex Job Status", ""];
   pushJobDetails(lines, job, {
-    showElapsed: job.status === "queued" || job.status === "running",
-    showDuration: job.status !== "queued" && job.status !== "running",
+    showElapsed: isActiveJob(job),
+    showDuration: !isActiveJob(job),
     showLog: true,
     showCancelHint: true,
     showResultHint: true,
@@ -389,33 +393,18 @@ export function renderJobStatusReport(job) {
 
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = threadId ? `codex resume ${threadId}` : null;
-  if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
-  }
-
+  const resumeCommand = formatCodexResumeCommand({ threadId });
+  // Reviews and failed or cancelled runs store their full report in `rendered`.
+  const prefersRendered =
+    isStructuredReviewStoredResult(storedJob) || job.status === "failed" || job.status === "cancelled";
   const rawOutput =
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
-  if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
-  }
-
-  if (storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+  const storedOutput = (prefersRendered && storedJob?.rendered) || rawOutput || storedJob?.rendered;
+  if (storedOutput) {
+    const output = ensureTrailingNewline(storedOutput);
+    return threadId ? `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n` : output;
   }
 
   const lines = [
