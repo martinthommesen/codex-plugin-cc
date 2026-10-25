@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { readJsonFile, writeJsonFile } from "./fs.mjs";
+import { readJsonFile, sleepSync, writeJsonFile } from "./fs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -14,6 +14,9 @@ const SESSION_POINTERS_DIR = path.join(FALLBACK_STATE_ROOT_DIR, "sessions");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+// A state update holds the lock for a few milliseconds; an older lock was left by a killed process.
+const STATE_LOCK_STALE_MS = 2000;
+const DEAD_PROCESS_MESSAGE = "The Codex companion process exited before the job finished.";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -69,10 +72,11 @@ export function readSessionPointer(sessionId) {
   try {
     const stat = fs.statSync(pointerFile);
     // The fallback root can sit in a shared temp directory: trust only our own file.
+    // Windows has no POSIX owner or mode bits (every writable file reports 0o666).
     if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
       return null;
     }
-    if ((stat.mode & 0o022) !== 0) {
+    if (process.platform !== "win32" && (stat.mode & 0o022) !== 0) {
       return null;
     }
     const { pluginDataDir } = readJsonFile(pointerFile);
@@ -130,11 +134,56 @@ export function loadState(cwd) {
         ...defaultState().config,
         ...(parsed.config ?? {})
       },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs.map(settleDeadJob) : []
     };
   } catch {
     return defaultState();
   }
+}
+
+let pidNamespace;
+
+// Pids are only comparable inside one PID namespace (Linux sandboxes may differ).
+export function currentPidNamespace() {
+  if (pidNamespace === undefined) {
+    try {
+      pidNamespace = fs.readlinkSync("/proc/self/ns/pid");
+    } catch {
+      pidNamespace = null;
+    }
+  }
+  return pidNamespace;
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// A companion killed mid-run (Esc on its Bash call, a hook timeout, a crash) never
+// records completion, so report an active job whose process is gone as failed.
+function settleDeadJob(job) {
+  if (
+    !isActiveJob(job) ||
+    !Number.isInteger(job.pid) ||
+    job.pid <= 0 ||
+    (job.pidNamespace ?? null) !== currentPidNamespace() ||
+    isProcessAlive(job.pid)
+  ) {
+    return job;
+  }
+  return {
+    ...job,
+    status: "failed",
+    phase: "failed",
+    pid: null,
+    errorMessage: job.errorMessage ?? DEAD_PROCESS_MESSAGE,
+    completedAt: job.completedAt ?? job.updatedAt ?? nowIso()
+  };
 }
 
 function pruneJobs(jobs) {
@@ -172,11 +221,45 @@ export function saveState(cwd, state, previousJobs = loadState(cwd).jobs) {
   return nextState;
 }
 
+// Serializes read-modify-write cycles across companion processes, which would
+// otherwise overwrite each other's job updates.
+function withStateLock(cwd, fn) {
+  ensureStateDir(cwd);
+  const lockFile = `${resolveStateFile(cwd)}.lock`;
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        if (Date.now() - fs.statSync(lockFile).mtimeMs > STATE_LOCK_STALE_MS) {
+          fs.rmSync(lockFile, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      sleepSync(5 + Math.floor(Math.random() * 10));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lockFile, { force: true });
+  }
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  const previousJobs = [...state.jobs];
-  mutate(state);
-  return saveState(cwd, state, previousJobs);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    const previousJobs = [...state.jobs];
+    mutate(state);
+    return saveState(cwd, state, previousJobs);
+  });
 }
 
 export function generateJobId(prefix = "job") {

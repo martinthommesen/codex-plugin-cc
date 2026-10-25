@@ -65,15 +65,31 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamTurn = null;
   const sockets = new Set();
+
+  // With a direct app-server a turn dies with its client; give brokered turns the
+  // same lifetime instead of letting them run (and edit files) with no owner.
+  function interruptOrphanedTurn(turn) {
+    if (!turn?.threadId || !turn?.turnId) {
+      return;
+    }
+    try {
+      appClient.request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId }).catch(() => {});
+    } catch {
+      // The runtime is already closing.
+    }
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
+      interruptOrphanedTurn(activeStreamTurn);
       activeStreamSocket = null;
       activeStreamThreadIds = null;
+      activeStreamTurn = null;
     }
   }
 
@@ -88,6 +104,7 @@ async function main() {
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         activeStreamSocket = null;
         activeStreamThreadIds = null;
+        activeStreamTurn = null;
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -202,8 +219,18 @@ async function main() {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            const turn = {
+              threadId: result?.reviewThreadId ?? message.params?.threadId ?? null,
+              turnId: result?.turn?.id ?? null
+            };
+            if (socket.destroyed) {
+              // The client left while the turn was starting: nobody will read it.
+              interruptOrphanedTurn(turn);
+            } else {
+              activeStreamSocket = socket;
+              activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+              activeStreamTurn = turn;
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -216,9 +243,8 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
-          }
+          // A failed side request (e.g. thread/turns/list on an ephemeral thread) does
+          // not end the socket's running turn, so keep routing its notifications.
         }
       }
     });
@@ -249,6 +275,12 @@ async function main() {
     });
   }
 
+  // e.g. the session dir was removed because readiness timed out: don't linger unreachable.
+  server.on("error", async (error) => {
+    process.stderr.write(`Broker could not listen on ${listenTarget.path}: ${error.message}\n`);
+    await shutdown(server).catch(() => {});
+    process.exit(1);
+  });
   server.listen(listenTarget.path);
 }
 

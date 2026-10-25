@@ -383,6 +383,12 @@ async function checkMissingTurnCompletion(client, state) {
     });
     turn = response?.data?.find((candidate) => candidate.id === state.turnId) ?? null;
   } catch {
+    // A dying connection also fails the lookup (the broker relays it as an RPC error
+    // before closing), so give the exit a moment to surface and leave it to rejectOnExit.
+    await Promise.race([client.exitPromise, new Promise((resolve) => setTimeout(resolve, 250))]);
+    if (client.exitResolved) {
+      return;
+    }
     // Ephemeral threads and older Codex builds cannot list turns.
     lookupFailed = true;
   }
@@ -422,6 +428,11 @@ function belongsToTurn(state, message) {
   const messageThreadId = extractThreadId(message);
   if (!messageThreadId || !state.threadIds.has(messageThreadId)) {
     return false;
+  }
+  // A subagent can run several turns (follow-up collab calls); each new turn
+  // re-pins its thread. Only the root thread is pinned to the captured turn.
+  if (message.method === "turn/started" && messageThreadId !== state.threadId) {
+    return true;
   }
   const trackedTurnId = state.threadTurnIds.get(messageThreadId) ?? null;
   const messageTurnId = extractTurnId(message);
@@ -550,6 +561,15 @@ function applyTurnNotification(state, message) {
       }
       break;
     case "error":
+      // Codex retries transient stream errors itself; those are not a failure yet.
+      if (message.params.willRetry) {
+        emitProgress(state.onProgress, `Codex error (retrying): ${message.params.error.message}`);
+        break;
+      }
+      if ((message.params.threadId ?? state.threadId) !== state.threadId) {
+        emitProgress(state.onProgress, `Subagent ${labelForThread(state, message.params.threadId)} error: ${message.params.error.message}`);
+        break;
+      }
       state.error = message.params.error;
       emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
       break;
@@ -609,7 +629,8 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      // Thread announcements carry no params.threadId; apply them as the live path does.
+      if (message.method === "thread/started" || message.method === "thread/name/updated" || belongsToTurn(state, message)) {
         applyTurnNotification(state, message);
       } else {
         previousHandler?.(message);
@@ -677,24 +698,29 @@ function sourceContentSha256(sourcePath) {
   return crypto.createHash("sha256").update(fs.readFileSync(sourcePath)).digest("hex");
 }
 
-function importedThreadIdForSource(sourcePath) {
+function ledgerRecordsForSource(sourcePath) {
   const ledgerPath = path.join(resolveCodexHome(), "external_agent_session_imports.json");
   if (!fs.existsSync(ledgerPath)) {
-    return null;
+    return [];
   }
   const ledger = readJsonFile(ledgerPath);
   const canonicalSource = fs.realpathSync(sourcePath);
-  const contentSha256 = sourceContentSha256(canonicalSource);
   const records = Array.isArray(ledger?.records) ? ledger.records : [];
-  const match = records
-    .filter(
-      (record) =>
-        record?.source_path === canonicalSource &&
-        record?.content_sha256 === contentSha256 &&
-        typeof record?.imported_thread_id === "string"
-    )
-    .at(-1);
-  return match?.imported_thread_id ?? null;
+  return records.filter(
+    (record) => record?.source_path === canonicalSource && typeof record?.imported_thread_id === "string"
+  );
+}
+
+function importedThreadIdForSource(sourcePath, previousThreadIds = new Set()) {
+  const records = ledgerRecordsForSource(sourcePath);
+  const contentSha256 = sourceContentSha256(fs.realpathSync(sourcePath));
+  const match = records.filter((record) => record.content_sha256 === contentSha256).at(-1);
+  if (match) {
+    return match.imported_thread_id;
+  }
+  // The live Claude transcript can grow after Codex hashed it, so also accept a
+  // record for this source that appeared during the import.
+  return records.filter((record) => !previousThreadIds.has(record.imported_thread_id)).at(-1)?.imported_thread_id ?? null;
 }
 
 function externalAgentSessionMigration(sourcePath, cwd) {
@@ -911,6 +937,10 @@ async function getCodexAuthStatusFromClient(client, cwd) {
 
     return buildAppServerAuthStatus(accountResponse, configResponse);
   } catch (error) {
+    // A busy shared broker says nothing about auth; let the caller retry directly.
+    if (error?.rpcCode === BROKER_BUSY_RPC_CODE) {
+      throw error;
+    }
     return buildAuthStatus({
       loggedIn: false,
       detail: error instanceof Error ? error.message : String(error),
@@ -989,7 +1019,16 @@ export async function getCodexAuthStatus(cwd, options = {}) {
       env: options.env,
       reuseExistingBroker: true
     });
-    return await getCodexAuthStatusFromClient(client, cwd);
+    try {
+      return await getCodexAuthStatusFromClient(client, cwd);
+    } catch (error) {
+      if (client.transport !== "broker" || error?.rpcCode !== BROKER_BUSY_RPC_CODE) {
+        throw error;
+      }
+      await client.close().catch(() => {});
+      client = await CodexAppServerClient.connect(cwd, { env: options.env, disableBroker: true });
+      return await getCodexAuthStatusFromClient(client, cwd);
+    }
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
@@ -1106,6 +1145,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
 
   return withDirectAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    const previousThreadIds = new Set(ledgerRecordsForSource(options.sourcePath).map((record) => record.imported_thread_id));
     try {
       await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
@@ -1117,7 +1157,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const threadId = importedThreadIdForSource(options.sourcePath, previousThreadIds);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
@@ -1220,7 +1260,7 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   if (!rawOutput) {
     return {
       parsed: null,
-      parseError: fallback.failureMessage ?? "Codex did not return a final structured message.",
+      parseError: fallback.failureMessage || "Codex did not return a final structured message.",
       rawOutput: rawOutput ?? "",
       ...fallback
     };

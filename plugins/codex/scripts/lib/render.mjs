@@ -101,8 +101,14 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
+// Review and stop-gate threads are ephemeral (never written to disk), so `codex resume`
+// cannot open them; only delegated tasks and transfers leave a resumable thread.
+export function hasResumableThread(job) {
+  return Boolean(job?.threadId) && job.jobClass !== "review" && job.kind !== "stop-review";
+}
+
 export function formatCodexResumeCommand(job) {
-  if (!job?.threadId) {
+  if (!hasResumableThread(job)) {
     return null;
   }
   return `codex resume ${job.threadId}`;
@@ -286,9 +292,19 @@ export function renderReviewResult(parsedResult, meta) {
     }
   }
 
+  appendFailureNote(lines, parsedResult.status, parsedResult.failureMessage);
   appendReasoningSection(lines, meta.reasoningSummary);
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+// Output can precede a failed or interrupted turn; say so instead of presenting it as clean.
+function appendFailureNote(lines, status, failureMessage) {
+  if (status === undefined || status === 0) {
+    return;
+  }
+  const detail = String(failureMessage ?? "").trim();
+  lines.push("", `Codex did not finish the review turn${detail ? `: ${detail}` : "."} The output above may be incomplete.`);
 }
 
 export function renderNativeReviewResult(result, meta) {
@@ -303,10 +319,11 @@ export function renderNativeReviewResult(result, meta) {
 
   if (stdout) {
     lines.push(stdout);
+    appendFailureNote(lines, result.status, result.failureMessage);
   } else if (result.status === 0) {
     lines.push("Codex review completed without any stdout output.");
   } else {
-    lines.push("Codex review failed.");
+    lines.push(`Codex review failed${result.failureMessage ? `: ${result.failureMessage}` : "."}`);
   }
 
   if (stderr) {
@@ -393,7 +410,10 @@ export function renderJobStatusReport(job) {
 
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = formatCodexResumeCommand({ threadId });
+  const resumeCommand = formatCodexResumeCommand({ ...storedJob, ...job, threadId });
+  const sessionLines = threadId
+    ? [`Codex session ID: ${threadId}`, ...(resumeCommand ? [`Resume in Codex: ${resumeCommand}`] : [])]
+    : [];
   // Reviews and failed or cancelled runs store their full report in `rendered`.
   const prefersRendered =
     isStructuredReviewStoredResult(storedJob) || job.status === "failed" || job.status === "cancelled";
@@ -404,7 +424,7 @@ export function renderStoredJobResult(job, storedJob) {
   const storedOutput = (prefersRendered && storedJob?.rendered) || rawOutput || storedJob?.rendered;
   if (storedOutput) {
     const output = ensureTrailingNewline(storedOutput);
-    return threadId ? `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n` : output;
+    return sessionLines.length > 0 ? `${output}\n${sessionLines.join("\n")}\n` : output;
   }
 
   const lines = [
@@ -414,10 +434,7 @@ export function renderStoredJobResult(job, storedJob) {
     `Status: ${job.status}`
   ];
 
-  if (threadId) {
-    lines.push(`Codex session ID: ${threadId}`);
-    lines.push(`Resume in Codex: ${resumeCommand}`);
-  }
+  lines.push(...sessionLines);
 
   if (job.summary) {
     lines.push(`Summary: ${job.summary}`);

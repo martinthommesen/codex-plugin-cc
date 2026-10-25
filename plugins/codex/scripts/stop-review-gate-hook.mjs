@@ -13,7 +13,9 @@ import { filterJobsForCurrentSession, sortJobsNewestFirst } from "./lib/job-cont
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Stay under the Stop hook's 900 s timeout (hooks.json) so a timeout still reports
+// a reason instead of Claude Code killing the hook first.
+const STOP_REVIEW_TIMEOUT_MS = 14 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
@@ -96,7 +98,7 @@ function runStopReview(cwd, input = {}) {
     return {
       ok: false,
       reason:
-        "The stop-time Codex review task timed out after 15 minutes. Run /codex:review --wait manually or bypass the gate."
+        "The stop-time Codex review task timed out after 14 minutes. Run /codex:review --wait manually or bypass the gate."
     };
   }
 

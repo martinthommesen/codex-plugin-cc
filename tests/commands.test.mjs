@@ -192,7 +192,7 @@ test("internal docs use task terminology for rescue runs", () => {
   const promptingSkill = read("skills/codex-prompting/SKILL.md");
   const promptRecipes = read("skills/codex-prompting/references/codex-prompt-recipes.md");
 
-  assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
+  assert.match(runtimeSkill, /codex-companion\.mjs" task \[runtime flags\] -- "<task text>"/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);

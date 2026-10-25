@@ -5,7 +5,13 @@ import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
-import { clearBrokerSession, loadBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "./lib/broker-lifecycle.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  releaseBrokerSession,
+  sendBrokerShutdown,
+  teardownBrokerSession
+} from "./lib/broker-lifecycle.mjs";
 import { readJsonStdin } from "./lib/fs.mjs";
 import {
   isActiveJob,
@@ -13,7 +19,7 @@ import {
   PLUGIN_DATA_ENV,
   removeSessionPointer,
   resolveStateFile,
-  saveState,
+  updateState,
   writeSessionPointer
 } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
@@ -56,14 +62,9 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  saveState(
-    workspaceRoot,
-    {
-      ...state,
-      jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
-    },
-    state.jobs
-  );
+  updateState(workspaceRoot, (latest) => {
+    latest.jobs = latest.jobs.filter((job) => job.sessionId !== sessionId);
+  });
 }
 
 function handleSessionStart(input) {
@@ -79,18 +80,26 @@ function handleSessionStart(input) {
 
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
   const brokerSession =
     loadBrokerSession(cwd) ?? (process.env[BROKER_ENDPOINT_ENV] ? { endpoint: process.env[BROKER_ENDPOINT_ENV] } : {});
+  // Other Claude sessions in this workspace may still be using the shared broker.
+  const keepBroker = releaseBrokerSession(cwd, brokerSession, sessionId).length > 0;
 
-  if (brokerSession.endpoint) {
+  if (brokerSession.endpoint && !keepBroker) {
     await sendBrokerShutdown(brokerSession.endpoint);
   }
 
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
   cleanupSessionJobs(cwd, sessionId);
-  removeSessionPointer(sessionId);
-  teardownBrokerSession({ ...brokerSession, killProcess: terminateProcessTree });
-  clearBrokerSession(cwd);
+  try {
+    removeSessionPointer(sessionId);
+  } catch {
+    // Not fatal; the broker still has to be torn down below.
+  }
+  if (!keepBroker) {
+    teardownBrokerSession({ ...brokerSession, killProcess: terminateProcessTree });
+    clearBrokerSession(cwd);
+  }
 }
 
 async function main() {

@@ -235,7 +235,7 @@ Use it to:
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.
-When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
+When available, it also includes the Codex session ID. For delegated tasks it also prints `codex resume <session-id>` so you can reopen that run directly in Codex; review and stop-gate threads are ephemeral and cannot be resumed.
 
 Examples:
 
@@ -283,7 +283,7 @@ You don't have to poll `/codex:status` while Codex works. In the terminal and in
 - **`/codex-jobs` pane.** Opens a live panel beside the chat. It lists this session's jobs with their phase, duration, summary, and latest progress lines. Each job has buttons:
   - **Cancel** for running jobs
   - **Result** for finished jobs, which runs `/codex:result <id>`
-  - **Copy resume**, which copies `codex resume <thread-id>` so you can continue in Codex
+  - **Copy resume** for delegated tasks, which copies `codex resume <thread-id>` so you can continue in Codex
 
 To turn system notifications off, open `/config` and set the plugin's **System notifications** option to off. Toasts and the status line stay on.
 
@@ -340,7 +340,7 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 
 ### Moving The Work Over To Codex
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
+Delegated tasks can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
 

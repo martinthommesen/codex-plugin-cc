@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { nowIso, readStoredJob, resolveJobLogFile, SESSION_ID_ENV, upsertJob, writeJobFile } from "./state.mjs";
+import {
+  currentPidNamespace,
+  nowIso,
+  readStoredJob,
+  resolveJobLogFile,
+  SESSION_ID_ENV,
+  upsertJob,
+  writeJobFile
+} from "./state.mjs";
 
 export { nowIso, SESSION_ID_ENV };
 
@@ -121,6 +129,18 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
+// The stored request (prompt included) is only read back from the job file, so keep
+// it out of the state.json index that every status poll loads and prints.
+export function indexRecord(record) {
+  const { request: _request, ...indexed } = record;
+  return indexed;
+}
+
+// /codex:cancel may have settled the job while this process was still running.
+function wasCancelled(job) {
+  return readStoredJob(job.workspaceRoot, job.id)?.status === "cancelled";
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -128,13 +148,17 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    pidNamespace: currentPidNamespace(),
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  upsertJob(job.workspaceRoot, indexRecord(runningRecord));
 
   try {
     const execution = await runner();
+    if (wasCancelled(job)) {
+      return execution;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -163,6 +187,9 @@ export async function runTrackedJob(job, runner, options = {}) {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJob(job.workspaceRoot, job.id) ?? runningRecord;
+    if (existing.status === "cancelled") {
+      throw error;
+    }
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,

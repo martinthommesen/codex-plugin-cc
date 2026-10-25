@@ -6,7 +6,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { createTempDir, readJsonFile, writeJsonFile } from "./fs.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { terminateProcessTree } from "./process.mjs";
+import { resolveStateDir, SESSION_ID_ENV } from "./state.mjs";
 
 const BROKER_STATE_FILE = "broker.json";
 const BROKER_SHUTDOWN_TIMEOUT_MS = 1000;
@@ -59,7 +60,8 @@ function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env =
     cwd,
     env,
     detached: true,
-    stdio: ["ignore", logFd, logFd]
+    stdio: ["ignore", logFd, logFd],
+    windowsHide: true
   });
   child.unref();
   fs.closeSync(logFd);
@@ -104,10 +106,23 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+// The broker is shared by every Claude session in the workspace; record which
+// sessions use it so SessionEnd only shuts it down for the last one.
+function registerBrokerUser(cwd, session, sessionId) {
+  const sessions = Array.isArray(session.sessions) ? session.sessions : [];
+  if (!sessionId || sessions.includes(sessionId)) {
+    return session;
+  }
+  const next = { ...session, sessions: [...sessions, sessionId] };
+  saveBrokerSession(cwd, next);
+  return next;
+}
+
 export async function ensureBrokerSession(cwd, options = {}) {
+  const sessionId = (options.env ?? process.env)[SESSION_ID_ENV] || null;
   const existing = loadBrokerSession(cwd);
   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
-    return existing;
+    return registerBrokerUser(cwd, existing, sessionId);
   }
 
   if (existing) {
@@ -133,28 +148,45 @@ export async function ensureBrokerSession(cwd, options = {}) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
-    });
-    return null;
-  }
-
-  const session = {
+  const spawned = {
     endpoint,
     pidFile,
     logFile,
     sessionDir,
     pid: child.pid ?? null
   };
+  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
+  if (!ready) {
+    // This broker is ours and unrecorded: stop it rather than leave it running.
+    teardownBrokerSession({ ...spawned, killProcess: options.killProcess ?? terminateProcessTree });
+    return null;
+  }
+
+  // Another companion may have started a broker for this workspace meanwhile; keep
+  // the recorded one so SessionEnd can reach every broker it has to stop.
+  const raced = loadBrokerSession(cwd);
+  if (raced?.endpoint && raced.endpoint !== endpoint && (await isBrokerEndpointReady(raced.endpoint))) {
+    await sendBrokerShutdown(endpoint);
+    teardownBrokerSession({ ...spawned, killProcess: options.killProcess ?? terminateProcessTree });
+    return registerBrokerUser(cwd, raced, sessionId);
+  }
+
+  const session = { ...spawned, sessions: sessionId ? [sessionId] : [] };
   saveBrokerSession(cwd, session);
   return session;
+}
+
+// Returns the sessions other than `sessionId` still using the workspace broker.
+export function releaseBrokerSession(cwd, session, sessionId) {
+  const sessions = Array.isArray(session?.sessions) ? session.sessions : [];
+  if (!sessionId) {
+    return [];
+  }
+  const remaining = sessions.filter((id) => id !== sessionId);
+  if (remaining.length > 0 && remaining.length !== sessions.length) {
+    saveBrokerSession(cwd, { ...session, sessions: remaining });
+  }
+  return remaining;
 }
 
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {

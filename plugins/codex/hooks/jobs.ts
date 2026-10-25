@@ -70,6 +70,18 @@ export function isActive(job: CodexJob): boolean {
   return job.status === 'queued' || job.status === 'running'
 }
 
+// Review and stop-gate threads are ephemeral, so `codex resume` cannot open them.
+export function canResume(job: CodexJob): boolean {
+  return job.threadId !== null && !job.kind.includes('review')
+}
+
+// Companion subcommands that start, settle or cancel a job.
+const JOB_COMMAND = /codex-companion\.mjs["']?\s+["']?(?:review|adversarial-review|task|cancel)(?=["'\s]|$)/
+
+export function startsOrSettlesJob(command: string): boolean {
+  return JOB_COMMAND.test(command)
+}
+
 // Jobs that were active in the previous snapshot and have now settled.
 export function settledSince(previous: readonly CodexJob[], next: readonly CodexJob[]): CodexJob[] {
   const wasActive = new Set(previous.filter(isActive).map(job => job.id))

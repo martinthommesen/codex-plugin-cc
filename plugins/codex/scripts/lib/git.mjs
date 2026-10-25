@@ -88,7 +88,10 @@ export function detectDefaultBranch(cwd) {
   if (symbolic.status === 0) {
     const remoteHead = symbolic.stdout.trim();
     if (remoteHead.startsWith("refs/remotes/origin/")) {
-      return remoteHead.replace("refs/remotes/origin/", "");
+      const branch = remoteHead.slice("refs/remotes/origin/".length);
+      // A clone of another branch has no local default branch; compare against the remote one.
+      const local = git(cwd, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+      return local.status === 0 ? branch : `origin/${branch}`;
     }
   }
 
@@ -111,10 +114,16 @@ export function getCurrentBranch(cwd) {
   return gitChecked(cwd, ["branch", "--show-current"]).stdout.trim() || "HEAD";
 }
 
+// -z keeps paths literal: without it git C-quotes names with non-ASCII or special characters.
+function listPaths(cwd, args) {
+  const [command, ...rest] = args;
+  return gitChecked(cwd, [command, "-z", ...rest]).stdout.split("\0").filter(Boolean);
+}
+
 export function getWorkingTreeState(cwd) {
-  const staged = gitChecked(cwd, ["diff", "--cached", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const unstaged = gitChecked(cwd, ["diff", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const untracked = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard"]).stdout.trim().split("\n").filter(Boolean);
+  const staged = listPaths(cwd, ["diff", "--cached", "--name-only"]);
+  const unstaged = listPaths(cwd, ["diff", "--name-only"]);
+  const untracked = listPaths(cwd, ["ls-files", "--others", "--exclude-standard"]);
 
   return {
     staged,
@@ -125,7 +134,8 @@ export function getWorkingTreeState(cwd) {
 }
 
 export function resolveReviewTarget(cwd, options = {}) {
-  ensureGitRepository(cwd);
+  // `git ls-files --others` only lists files under its cwd, so inspect from the root.
+  const repoRoot = ensureGitRepository(cwd);
 
   const requestedScope = options.scope ?? "auto";
   const baseRef = options.base ?? null;
@@ -164,7 +174,7 @@ export function resolveReviewTarget(cwd, options = {}) {
     };
   }
 
-  if (getWorkingTreeState(cwd).isDirty) {
+  if (getWorkingTreeState(repoRoot).isDirty) {
     return {
       mode: "working-tree",
       label: "working tree diff",
@@ -254,7 +264,7 @@ function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
-  const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
+  const changedFiles = listPaths(cwd, ["diff", "--name-only", comparison.commitRange]);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
 
@@ -314,7 +324,7 @@ export function collectReviewContext(cwd, target, options = {}) {
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
-    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
+    const fileCount = listPaths(repoRoot, ["diff", "--name-only", comparison.commitRange]).length;
     diffBytes = measureGitOutputBytes(
       repoRoot,
       ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],

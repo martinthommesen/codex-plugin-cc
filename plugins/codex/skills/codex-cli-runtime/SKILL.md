@@ -9,7 +9,8 @@ user-invocable: false
 Use this skill only inside the `codex:codex-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task [runtime flags] -- "<task text>"`
+- Put the runtime flags (`--write`, `--resume-last`, `--model <model>`, `--effort <effort>`) before `--`, each as its own argument, and the task text after `--` as one quoted argument. Everything after `--` reaches Codex verbatim: flag-like words, quotes, backslashes and newlines in the task text are not reinterpreted.
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.

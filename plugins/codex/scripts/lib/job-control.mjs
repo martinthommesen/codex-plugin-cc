@@ -191,7 +191,8 @@ function matchJobReference(jobs, reference, predicate = () => true) {
     throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
   }
 
-  throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
+  // Callers explain a miss themselves (e.g. the job exists but is still running).
+  return null;
 }
 
 export function buildStatusSnapshot(cwd, options = {}) {
@@ -228,7 +229,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const jobs = sortJobsNewestFirst(loadState(workspaceRoot).jobs);
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
-    throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
+    throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
   }
 
   return {
@@ -270,7 +271,12 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);
     if (!selected) {
-      throw new Error(`No active job found for "${reference}".`);
+      const known = matchJobReference(sortJobsNewestFirst(loadState(workspaceRoot).jobs), reference);
+      throw new Error(
+        known
+          ? `Job ${known.id} is already ${known.status}; there is nothing to cancel.`
+          : `No active job found for "${reference}". Run /codex:status to list known jobs.`
+      );
     }
     return { workspaceRoot, job: selected };
   }

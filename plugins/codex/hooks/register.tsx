@@ -9,12 +9,14 @@ import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { CodexJob } from '../types'
 import {
+  canResume,
   clip,
   durationMs,
   isActive,
   parseStatusSnapshot,
   settledMessage,
   settledSince,
+  startsOrSettlesJob,
   statusLine,
 } from './jobs'
 
@@ -116,6 +118,8 @@ async function poll($: EngineInterface) {
     hasFailed = true
     poller?.cancel()
     poller = null
+    // Don't leave a frozen "running" entry behind while live status is unavailable.
+    $.ui.status(undefined)
   }
 }
 
@@ -141,7 +145,7 @@ async function showResult($: EngineInterface, job: CodexJob) {
 }
 
 async function copyResume($: EngineInterface, job: CodexJob, surface: RenderSurface) {
-  if (!job.threadId) return
+  if (!canResume(job)) return
   const copied = await $.ui.copy({ text: `codex resume ${job.threadId}`, surface })
   $.ui.toast(copied.isCopied ? 'Copied the codex resume command.' : `codex resume ${job.threadId}`)
 }
@@ -171,11 +175,18 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // Any companion call (a review, a rescue's forwarder, a status check) may
-  // start or settle a job: poll while it runs and briefly after.
+  // A review, task or cancel may start or settle a job: poll while it runs and
+  // briefly after. Other companion calls (status, result, setup) refresh once.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     if (!e.command.includes('codex-companion.mjs')) {
       return next(e)
+    }
+    if (!startsOrSettlesJob(e.command)) {
+      const ran = await next(e)
+      if (hasJobs) {
+        void refresh($)
+      }
+      return ran
     }
     void arm($)
     const ran = await next(e)
@@ -234,7 +245,7 @@ export const register: Register = (on, options) => {
                 ) : (
                   <Button key={`result:${job.id}`} label="Result" onPress={() => void showResult($, job)} />
                 )}
-                {job.threadId ? (
+                {canResume(job) ? (
                   <Button
                     key={`resume:${job.id}`}
                     label="Copy resume"

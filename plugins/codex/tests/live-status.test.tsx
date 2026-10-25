@@ -132,10 +132,25 @@ test('other Bash calls do not run the companion', async ($, on) => {
   expect(seen.argv).toEqual([])
 })
 
+test('read-only companion calls do not start the launch window', async ($, on) => {
+  const clock = mock.clock(on)
+  const seen = world(on)
+
+  await $.tool.call({ tool: 'Bash', command: 'node "/plugin/scripts/codex-companion.mjs" status "" ' })
+  await clock.advance(60_000)
+
+  // No jobs seen yet, so a status call does not poll at all.
+  expect(seen.argv).toEqual([])
+})
+
 test('the pane lists jobs with their actions, on every surface', async ($, on) => {
   const clock = mock.clock(on)
   const seen = world(on)
-  seen.stdout = snapshot([running, { ...completed, id: 'task-xyz', kind: 'task', kindLabel: 'rescue', threadId: null }])
+  seen.stdout = snapshot([
+    running,
+    { ...completed, id: 'task-xyz', kind: 'task', kindLabel: 'rescue', threadId: 'thr-2' },
+    { ...completed, id: 'task-old', kind: 'task', kindLabel: 'rescue', threadId: null },
+  ])
   await $.tool.call({ tool: 'Bash', command: COMPANION })
   await clock.settle()
 
@@ -143,9 +158,11 @@ test('the pane lists jobs with their actions, on every surface', async ($, on) =
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /1 running/ }))?.text).toBe('1 running')
     expect(await ui.find({ key: 'cancel:review-abc' })).toBeDefined()
-    expect(await ui.find({ key: 'resume:review-abc' })).toBeDefined()
+    // Review threads are ephemeral: nothing to resume.
+    expect(await ui.find({ key: 'resume:review-abc' })).toBeUndefined()
     expect(await ui.find({ key: 'result:task-xyz' })).toBeDefined()
-    expect(await ui.find({ key: 'resume:task-xyz' })).toBeUndefined()
+    expect(await ui.find({ key: 'resume:task-xyz' })).toBeDefined()
+    expect(await ui.find({ key: 'resume:task-old' })).toBeUndefined()
     await ui.unmount()
   }
 

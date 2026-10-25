@@ -1332,12 +1332,13 @@ test("status shows phases, hints, and the latest finished job", () => {
   assert.match(result.stdout, /Session runtime: direct startup/);
   assert.match(result.stdout, /Phase: reviewing/);
   assert.match(result.stdout, /Codex session ID: thr_1/);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_1/);
+  // Review threads are ephemeral, so no resume command is offered for them.
+  assert.doesNotMatch(result.stdout, /Resume in Codex: codex resume thr_1/);
   assert.match(result.stdout, /Thread ready \(thr_1\)\./);
   assert.match(result.stdout, /Reviewer started: current changes/);
   assert.match(result.stdout, /Duration: 1m 5s/);
   assert.match(result.stdout, /Codex session ID: thr_done/);
-  assert.match(result.stdout, /Resume in Codex: codex resume thr_done/);
+  assert.doesNotMatch(result.stdout, /Resume in Codex: codex resume thr_done/);
 });
 
 test("status without a job id only shows jobs from the current Claude session", () => {
@@ -1591,7 +1592,7 @@ test("result returns the stored output for the latest finished job by default", 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout,
-    "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\nResume in Codex: codex resume thr_review_finished\n"
+    "Reviewed uncommitted changes.\nNo material issues found.\n\nCodex session ID: thr_review_finished\n"
   );
 });
 
@@ -1689,7 +1690,7 @@ test("result without a job id prefers the latest finished job from the current C
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     result.stdout,
-    "Current session output.\n\nCodex session ID: thr_current\nResume in Codex: codex resume thr_current\n"
+    "Current session output.\n\nCodex session ID: thr_current\n"
   );
 });
 
@@ -2436,4 +2437,80 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+test("cancel stops a job whose process is not a process-group leader", async (t) => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  // Like a companion started by Claude's Bash tool: the shell leads the group, node does not.
+  const pidFile = path.join(workspace, "child.pid");
+  const shell = spawn(
+    "sh",
+    ["-c", `"${process.execPath}" -e "require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)" "${pidFile}"; true`],
+    { cwd: workspace, detached: true, stdio: "ignore" }
+  );
+  shell.unref();
+  t.after(() => {
+    try {
+      process.kill(-shell.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  const childPid = await waitFor(() => (fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8")) : null));
+  assert.notEqual(childPid, shell.pid);
+
+  const logFile = path.join(jobsDir, "review-fg.log");
+  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(path.join(jobsDir, "review-fg.json"), JSON.stringify({ id: "review-fg", status: "running", logFile }), "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [{ id: "review-fg", status: "running", jobClass: "review", pid: childPid, logFile, updatedAt: "2026-03-18T15:30:02.000Z" }]
+    }),
+    "utf8"
+  );
+
+  const cancelResult = run("node", [SCRIPT, "cancel", "review-fg", "--json"], { cwd: workspace });
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+
+  await waitFor(() => {
+    try {
+      process.kill(childPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+});
+
+test("session end keeps a shared broker that another Claude session still uses", () => {
+  const workspace = makeTempDir();
+  saveBrokerSession(workspace, {
+    endpoint: `unix:${path.join(workspace, "missing.sock")}`,
+    pidFile: null,
+    logFile: null,
+    sessionDir: null,
+    pid: null,
+    sessions: ["sess-a", "sess-b"]
+  });
+
+  const endA = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace, session_id: "sess-a" })
+  });
+  assert.equal(endA.status, 0, endA.stderr);
+  assert.deepEqual(loadBrokerSession(workspace)?.sessions, ["sess-b"]);
+
+  const endB = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: workspace, session_id: "sess-b" })
+  });
+  assert.equal(endB.status, 0, endB.stderr);
+  assert.equal(loadBrokerSession(workspace), null);
 });

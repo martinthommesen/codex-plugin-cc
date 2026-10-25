@@ -30,6 +30,7 @@ import { collectReviewContext, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  currentPidNamespace,
   generateJobId,
   getConfig,
   isActiveJob,
@@ -54,6 +55,7 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  indexRecord,
   nowIso,
   runTrackedJob
 } from "./lib/tracked-jobs.mjs";
@@ -76,6 +78,7 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+const STOP_REVIEW_TITLE = "Codex Stop Gate Review";
 
 function printUsage() {
   console.log(
@@ -274,8 +277,19 @@ function renderStatusPayload(report, asJson) {
   return asJson ? report : renderStatusReport(report);
 }
 
+// Stop-gate reviews run through `task` but are not rescue threads to continue.
+function isStopReviewJob(job) {
+  return job.kind === "stop-review" || job.title === STOP_REVIEW_TITLE;
+}
+
 function findLatestResumableTaskJob(jobs) {
-  return jobs.find((job) => job.jobClass === "task" && job.threadId && !isActiveJob(job)) ?? null;
+  return (
+    jobs.find((job) => job.jobClass === "task" && job.threadId && !isActiveJob(job) && !isStopReviewJob(job)) ?? null
+  );
+}
+
+function findActiveTaskJob(jobs) {
+  return jobs.find((job) => job.jobClass === "task" && isActiveJob(job) && !isStopReviewJob(job)) ?? null;
 }
 
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
@@ -301,7 +315,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const sessionId = getCurrentSessionId();
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && isActiveJob(job));
+  const activeTask = findActiveTaskJob(visibleJobs);
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
   }
@@ -347,7 +361,8 @@ async function executeReviewRun(request) {
       {
         status: result.status,
         stdout: result.reviewText,
-        stderr: result.stderr
+        stderr: result.stderr,
+        failureMessage: result.error?.message || (result.turn?.status && result.turn.status !== "completed" ? `turn ${result.turn.status}` : "")
       },
       { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
     );
@@ -437,10 +452,10 @@ async function executeTaskRun(request) {
     resumeThreadId = latestThread.id;
   }
 
-  if (!request.prompt && !resumeThreadId) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
-  }
+  requireTaskRequest(request.prompt, Boolean(resumeThreadId));
 
+  // Stop-gate reviews are one-shot: keep their threads out of `codex resume` and --resume-last.
+  const persistThread = !taskMetadata.stopReview;
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
@@ -449,8 +464,9 @@ async function executeTaskRun(request) {
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    persistThread,
+    threadName:
+      resumeThreadId || !persistThread ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -490,8 +506,9 @@ function buildReviewJobMetadata(reviewName, target) {
 function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
-      title: "Codex Stop Gate Review",
-      summary: "Stop-gate review of previous Claude turn"
+      title: STOP_REVIEW_TITLE,
+      summary: "Stop-gate review of previous Claude turn",
+      stopReview: true
     };
   }
 
@@ -508,8 +525,8 @@ function renderQueuedTaskLaunch(payload) {
 }
 
 function getJobKindLabel(kind, jobClass) {
-  if (kind === "adversarial-review") {
-    return "adversarial-review";
+  if (kind === "adversarial-review" || kind === "stop-review") {
+    return kind;
   }
   return jobClass === "review" ? "review" : "rescue";
 }
@@ -542,7 +559,7 @@ function createTrackedProgress(job, options = {}) {
 function buildTaskJob(workspaceRoot, taskMetadata, write) {
   return createCompanionJob({
     prefix: "task",
-    kind: "task",
+    kind: taskMetadata.stopReview ? "stop-review" : "task",
     title: taskMetadata.title,
     workspaceRoot,
     jobClass: "task",
@@ -588,7 +605,7 @@ function readTaskPrompt(cwd, options, positionals) {
 }
 
 function requireTaskRequest(prompt, resumeLast) {
-  if (!prompt && !resumeLast) {
+  if (!String(prompt ?? "").trim() && !resumeLast) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 }
@@ -619,21 +636,39 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
+function updateQueuedJobPid(workspaceRoot, jobId, pid) {
+  if (pid == null) {
+    return;
+  }
+  // The detached worker is this child, so its running record carries the same pid.
+  const pidNamespace = currentPidNamespace();
+  upsertJob(workspaceRoot, { id: jobId, pid, pidNamespace });
+  const stored = readStoredJob(workspaceRoot, jobId);
+  if (stored?.status === "queued") {
+    writeJobFile(workspaceRoot, jobId, { ...stored, pid, pidNamespace });
+  }
+}
+
 function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // The worker reads its request from the job file, so write it before spawning.
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  upsertJob(job.workspaceRoot, indexRecord(queuedRecord));
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  // The worker records its own pid once it starts running; record the child's only
+  // while it is still queued, so a quick worker's running record is not regressed.
+  updateQueuedJobPid(job.workspaceRoot, job.id, child.pid ?? null);
 
   return {
     payload: {
@@ -659,6 +694,7 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
+  const model = normalizeRequestedModel(options.model);
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -680,7 +716,7 @@ async function handleReviewCommand(argv, config) {
       executeReviewRun({
         cwd,
         target,
-        model: options.model,
+        model,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -853,7 +889,8 @@ function handleTaskResumeCandidate(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentSessionId();
   const jobs = filterJobsForCurrentSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
+  // `task --resume-last` refuses while a task is running, so don't offer to continue then.
+  const candidate = findActiveTaskJob(jobs) ? null : findLatestResumableTaskJob(jobs);
 
   const payload = {
     available: Boolean(candidate),
@@ -901,7 +938,11 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  try {
+    terminateProcessTree(job.pid ?? Number.NaN);
+  } catch (error) {
+    appendLogLine(job.logFile, `Could not stop process ${job.pid}: ${error instanceof Error ? error.message : String(error)}`);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();

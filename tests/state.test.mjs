@@ -174,3 +174,30 @@ test("readSessionPointer ignores pointers others could have written", () => {
   assert.equal(writeSessionPointer(sessionId, "relative/dir"), null);
   assert.equal(readSessionPointer(""), null);
 });
+
+test("loadState reports an active job whose process is gone as failed", async () => {
+  const { loadState } = await import("../plugins/codex/scripts/lib/state.mjs");
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  // Spawn and reap a process to get a pid that no longer exists.
+  const { spawnSync } = await import("node:child_process");
+  const deadPid = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" }).stdout;
+  fs.writeFileSync(
+    stateFile,
+    JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [
+        { id: "task-dead", status: "running", pid: Number(deadPid), updatedAt: "2026-01-01T00:00:00.000Z" },
+        { id: "task-live", status: "running", pid: process.pid, updatedAt: "2026-01-01T00:00:00.000Z" }
+      ]
+    })
+  );
+
+  const { jobs, config } = loadState(workspace);
+  assert.equal(config.stopReviewGate, true);
+  assert.equal(jobs.find((job) => job.id === "task-dead").status, "failed");
+  assert.match(jobs.find((job) => job.id === "task-dead").errorMessage, /exited before the job finished/);
+  assert.equal(jobs.find((job) => job.id === "task-live").status, "running");
+});

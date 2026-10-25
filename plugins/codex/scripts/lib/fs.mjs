@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
 export function ensureAbsolutePath(cwd, maybePath) {
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(cwd, maybePath);
@@ -14,8 +15,36 @@ export function readJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+// Several companion processes read these files while others write them, so write
+// a sibling temp file and rename it into place: readers never see a partial file.
 export function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tempPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  try {
+    renameWithRetry(tempPath, filePath);
+  } catch (error) {
+    fs.rmSync(tempPath, { force: true });
+    throw error;
+  }
+}
+
+// Windows refuses to replace a file another process has open; retry briefly.
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= 20 || (error?.code !== "EPERM" && error?.code !== "EBUSY" && error?.code !== "EACCES")) {
+        throw error;
+      }
+      sleepSync(10);
+    }
+  }
+}
+
+export function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function isProbablyText(buffer) {
