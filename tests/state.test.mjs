@@ -176,7 +176,9 @@ test("readSessionPointer ignores pointers others could have written", () => {
 });
 
 test("loadState reports an active job whose process is gone as failed", async () => {
-  const { loadState } = await import("../plugins/codex/scripts/lib/state.mjs");
+  const { currentPidNamespace, loadState } = await import("../plugins/codex/scripts/lib/state.mjs");
+  // Real job records carry the writer's PID namespace (null outside Linux).
+  const pidNamespace = currentPidNamespace();
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
@@ -189,8 +191,10 @@ test("loadState reports an active job whose process is gone as failed", async ()
       version: 1,
       config: { stopReviewGate: true },
       jobs: [
-        { id: "task-dead", status: "running", pid: Number(deadPid), updatedAt: "2026-01-01T00:00:00.000Z" },
-        { id: "task-live", status: "running", pid: process.pid, updatedAt: "2026-01-01T00:00:00.000Z" }
+        { id: "task-dead", status: "running", pid: Number(deadPid), pidNamespace, updatedAt: "2026-01-01T00:00:00.000Z" },
+        { id: "task-live", status: "running", pid: process.pid, pidNamespace, updatedAt: "2026-01-01T00:00:00.000Z" },
+        // Recorded in another PID namespace: its pid can't be checked from here.
+        { id: "task-elsewhere", status: "running", pid: Number(deadPid), pidNamespace: "pid:[0]", updatedAt: "2026-01-01T00:00:00.000Z" }
       ]
     })
   );
@@ -200,4 +204,5 @@ test("loadState reports an active job whose process is gone as failed", async ()
   assert.equal(jobs.find((job) => job.id === "task-dead").status, "failed");
   assert.match(jobs.find((job) => job.id === "task-dead").errorMessage, /exited before the job finished/);
   assert.equal(jobs.find((job) => job.id === "task-live").status, "running");
+  assert.equal(jobs.find((job) => job.id === "task-elsewhere").status, "running");
 });
