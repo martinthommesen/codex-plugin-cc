@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex, readFakeCodexState } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, takeCreatedTempDirs } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -15,6 +15,21 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+// Commands lazily start a detached shared broker per workspace, which normally lives
+// until Claude's SessionEnd. End each test's sessions so brokers and their fake
+// app-servers don't outlive the suite.
+afterEach(() => {
+  for (const dir of takeCreatedTempDirs()) {
+    if (!loadBrokerSession(dir)) {
+      continue;
+    }
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: dir,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: dir })
+    });
+  }
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();

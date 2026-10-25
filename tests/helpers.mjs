@@ -4,8 +4,19 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+const createdTempDirs = new Set();
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  createdTempDirs.add(dir);
+  return dir;
+}
+
+// Returns the temp dirs created since the last call, so per-test hooks can clean up after them.
+export function takeCreatedTempDirs() {
+  const dirs = [...createdTempDirs];
+  createdTempDirs.clear();
+  return dirs;
 }
 
 export function writeExecutable(filePath, source) {
