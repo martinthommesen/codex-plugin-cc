@@ -43,6 +43,39 @@ function renameWithRetry(from, to) {
   }
 }
 
+// Holders keep a lock for a few milliseconds; an older lock was left by a killed process.
+const LOCK_STALE_MS = 2000;
+
+// Runs a synchronous read-modify-write while holding an exclusive lock file, so
+// concurrent companion and hook processes don't overwrite each other's updates.
+export function withFileLock(lockFile, fn) {
+  let fd = null;
+  while (fd === null) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      try {
+        if (Date.now() - fs.statSync(lockFile).mtimeMs > LOCK_STALE_MS) {
+          fs.rmSync(lockFile, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      sleepSync(5 + Math.floor(Math.random() * 10));
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    fs.rmSync(lockFile, { force: true });
+  }
+}
+
 export function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }

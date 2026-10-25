@@ -5,7 +5,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { createTempDir, readJsonFile, writeJsonFile } from "./fs.mjs";
+import { createTempDir, readJsonFile, withFileLock, writeJsonFile } from "./fs.mjs";
 import { terminateProcessTree } from "./process.mjs";
 import { resolveStateDir, SESSION_ID_ENV } from "./state.mjs";
 
@@ -106,16 +106,33 @@ async function isBrokerEndpointReady(endpoint) {
   }
 }
 
+function sessionsOf(session) {
+  return Array.isArray(session?.sessions) ? session.sessions : [];
+}
+
+// Every change to the sessions list re-reads broker.json under a lock: callers
+// race (several companions start at once, SessionEnd runs alongside them), and a
+// list read before an await would drop sessions registered in the meantime.
+function updateBrokerSession(cwd, mutate) {
+  const stateDir = resolveStateDir(cwd);
+  fs.mkdirSync(stateDir, { recursive: true });
+  return withFileLock(`${resolveBrokerStateFile(cwd)}.lock`, () => mutate(loadBrokerSession(cwd)));
+}
+
 // The broker is shared by every Claude session in the workspace; record which
 // sessions use it so SessionEnd only shuts it down for the last one.
 function registerBrokerUser(cwd, session, sessionId) {
-  const sessions = Array.isArray(session.sessions) ? session.sessions : [];
-  if (!sessionId || sessions.includes(sessionId)) {
-    return session;
-  }
-  const next = { ...session, sessions: [...sessions, sessionId] };
-  saveBrokerSession(cwd, next);
-  return next;
+  return updateBrokerSession(cwd, (current) => {
+    // Only extend the record for the broker we connected to.
+    const base = current?.endpoint === session.endpoint ? current : session;
+    const sessions = sessionsOf(base);
+    if (!sessionId || sessions.includes(sessionId)) {
+      return base;
+    }
+    const next = { ...base, sessions: [...sessions, sessionId] };
+    saveBrokerSession(cwd, next);
+    return next;
+  });
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {
@@ -171,22 +188,30 @@ export async function ensureBrokerSession(cwd, options = {}) {
     return registerBrokerUser(cwd, raced, sessionId);
   }
 
-  const session = { ...spawned, sessions: sessionId ? [sessionId] : [] };
-  saveBrokerSession(cwd, session);
-  return session;
+  return updateBrokerSession(cwd, (current) => {
+    // Keep sessions a concurrent caller already registered for this broker.
+    const sessions = current?.endpoint === endpoint ? sessionsOf(current) : [];
+    const session = { ...spawned, sessions: sessionId && !sessions.includes(sessionId) ? [...sessions, sessionId] : sessions };
+    saveBrokerSession(cwd, session);
+    return session;
+  });
 }
 
 // Returns the sessions other than `sessionId` still using the workspace broker.
 export function releaseBrokerSession(cwd, session, sessionId) {
-  const sessions = Array.isArray(session?.sessions) ? session.sessions : [];
   if (!sessionId) {
     return [];
   }
-  const remaining = sessions.filter((id) => id !== sessionId);
-  if (remaining.length > 0 && remaining.length !== sessions.length) {
-    saveBrokerSession(cwd, { ...session, sessions: remaining });
-  }
-  return remaining;
+  return updateBrokerSession(cwd, (current) => {
+    // A record without an endpoint came from the environment, not broker.json.
+    const record = current?.endpoint && current.endpoint === session?.endpoint ? current : session;
+    const sessions = sessionsOf(record);
+    const remaining = sessions.filter((id) => id !== sessionId);
+    if (remaining.length > 0 && remaining.length !== sessions.length && record === current) {
+      saveBrokerSession(cwd, { ...current, sessions: remaining });
+    }
+    return remaining;
+  });
 }
 
 export function teardownBrokerSession({ endpoint = null, pidFile, logFile, sessionDir = null, pid = null, killProcess = null }) {

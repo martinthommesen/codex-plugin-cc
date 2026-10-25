@@ -26,6 +26,8 @@ const POLL_MS = 4_000
 // returns, so keep polling for a while after any companion call.
 const LAUNCH_GRACE_MS = 30_000
 const NOTIFY_AFTER_MS = 30_000
+// Keep retrying a failing status call for about a minute while a job is active.
+const MAX_FAILED_POLLS = 15
 
 // Change the tag when CodexJob's fields change: a value stored by an earlier
 // version outlives a reload and is then read as empty.
@@ -54,8 +56,10 @@ let isNotifying = true
 let poller: Timer | null = null
 let armedUntil = 0
 let refreshing: Promise<void> | null = null
-let hasFailed = false
+let failedPolls = 0
 let hasJobs = false
+// The first snapshot is history: only later snapshots can reveal newly finished jobs.
+let hasBaseline = false
 
 function companion($: EngineInterface, sessionId: string, args: string[]) {
   return $.process.run(['node', `${$.plugin.root}/scripts/codex-companion.mjs`, ...args], {
@@ -102,29 +106,39 @@ async function poll($: EngineInterface) {
       previous = list
       return next
     })
-    hasFailed = false
+    failedPolls = 0
     hasJobs = next.length > 0
     $.ui.status(statusLine(next))
-    for (const job of settledSince(previous, next)) {
+    for (const job of settledSince(previous, next, { hasBaseline })) {
       await announce($, job)
     }
+    hasBaseline = true
     await schedule($, next)
   } catch (error) {
-    // Said once per failure streak; the next companion call retries.
-    if (!hasFailed) {
+    // Said once per failure streak.
+    if (failedPolls === 0) {
       const reason = error instanceof Error ? error.message : String(error)
       $.ui.log(`codex: live status unavailable: ${reason}`, { to: 'debug' })
     }
-    hasFailed = true
-    poller?.cancel()
-    poller = null
+    failedPolls += 1
     // Don't leave a frozen "running" entry behind while live status is unavailable.
     $.ui.status(undefined)
+    // A transient failure must not end monitoring of a running job: keep the
+    // poller while the last snapshot had active jobs, for a bounded number of
+    // tries. After that, the next companion call or finished turn retries.
+    const known = await read($, jobs)
+    if (failedPolls >= MAX_FAILED_POLLS) {
+      poller?.cancel()
+      poller = null
+    } else {
+      await schedule($, known)
+    }
   }
 }
 
 async function arm($: EngineInterface) {
   armedUntil = (await $.clock.now()) + LAUNCH_GRACE_MS
+  failedPolls = 0
   await refresh($)
 }
 

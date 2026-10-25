@@ -82,10 +82,21 @@ export function startsOrSettlesJob(command: string): boolean {
   return JOB_COMMAND.test(command)
 }
 
-// Jobs that were active in the previous snapshot and have now settled.
-export function settledSince(previous: readonly CodexJob[], next: readonly CodexJob[]): CodexJob[] {
+// Jobs that settled since the previous snapshot: ones that were active then, and,
+// once a baseline snapshot exists, ones that started and finished between polls.
+// Stop-gate reviews run inside the Stop hook, so only announce those seen running.
+export function settledSince(
+  previous: readonly CodexJob[],
+  next: readonly CodexJob[],
+  { hasBaseline = false }: { hasBaseline?: boolean } = {},
+): CodexJob[] {
   const wasActive = new Set(previous.filter(isActive).map(job => job.id))
-  return next.filter(job => wasActive.has(job.id) && !isActive(job))
+  const wasKnown = new Set(previous.map(job => job.id))
+  return next.filter(
+    job =>
+      !isActive(job) &&
+      (wasActive.has(job.id) || (hasBaseline && !wasKnown.has(job.id) && job.kind !== 'stop-review')),
+  )
 }
 
 export function statusLine(jobs: readonly CodexJob[]): string | undefined {

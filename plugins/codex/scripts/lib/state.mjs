@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { readJsonFile, sleepSync, writeJsonFile } from "./fs.mjs";
+import { readJsonFile, withFileLock, writeJsonFile } from "./fs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -14,8 +14,6 @@ const SESSION_POINTERS_DIR = path.join(FALLBACK_STATE_ROOT_DIR, "sessions");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
-// A state update holds the lock for a few milliseconds; an older lock was left by a killed process.
-const STATE_LOCK_STALE_MS = 2000;
 const DEAD_PROCESS_MESSAGE = "The Codex companion process exited before the job finished.";
 
 export function nowIso() {
@@ -221,40 +219,11 @@ export function saveState(cwd, state, previousJobs = loadState(cwd).jobs) {
   return nextState;
 }
 
-// Serializes read-modify-write cycles across companion processes, which would
-// otherwise overwrite each other's job updates.
-function withStateLock(cwd, fn) {
-  ensureStateDir(cwd);
-  const lockFile = `${resolveStateFile(cwd)}.lock`;
-  let fd = null;
-  while (fd === null) {
-    try {
-      fd = fs.openSync(lockFile, "wx");
-    } catch (error) {
-      if (error?.code !== "EEXIST") {
-        throw error;
-      }
-      try {
-        if (Date.now() - fs.statSync(lockFile).mtimeMs > STATE_LOCK_STALE_MS) {
-          fs.rmSync(lockFile, { force: true });
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      sleepSync(5 + Math.floor(Math.random() * 10));
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    fs.closeSync(fd);
-    fs.rmSync(lockFile, { force: true });
-  }
-}
-
 export function updateState(cwd, mutate) {
-  return withStateLock(cwd, () => {
+  ensureStateDir(cwd);
+  // Serializes read-modify-write cycles across companion processes, which would
+  // otherwise overwrite each other's job updates.
+  return withFileLock(`${resolveStateFile(cwd)}.lock`, () => {
     const state = loadState(cwd);
     const previousJobs = [...state.jobs];
     mutate(state);

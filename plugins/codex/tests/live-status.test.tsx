@@ -50,6 +50,7 @@ function snapshot(jobs: Array<Record<string, unknown>>) {
 function world(on: On) {
   const seen = {
     stdout: snapshot([]),
+    exitCode: 0,
     argv: [] as string[][],
     env: [] as Array<Record<string, string> | undefined>,
     toasts: [] as string[],
@@ -64,7 +65,7 @@ function world(on: On) {
   on('process.run', (_, e) => {
     seen.argv.push([...e.argv])
     seen.env.push(e.init?.env)
-    return { value: { exitCode: 0, stdout: seen.stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode: seen.exitCode, stdout: seen.stdout, stderr: seen.exitCode ? 'boom' : '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.toast', (_, e) => {
     seen.toasts.push(e.text)
@@ -106,6 +107,52 @@ test('a companion run shows in the status line and announces when it settles', a
   await clock.advance(60_000)
   expect(seen.toasts.length).toBe(1)
   expect(seen.argv.length).toBe(calls)
+})
+
+test('a failed status poll keeps watching a running job', async ($, on) => {
+  const clock = mock.clock(on)
+  const seen = world(on)
+
+  seen.stdout = snapshot([running])
+  await $.tool.call({ tool: 'Bash', command: COMPANION })
+  await clock.settle()
+  expect(seen.statuses.at(-1)).toBe('codex: review reviewing 12s')
+
+  // Past the launch window, so only the running job keeps the poller alive.
+  seen.exitCode = 1
+  await clock.advance(40_000)
+  expect(seen.statuses.at(-1)).toBeUndefined()
+
+  seen.exitCode = 0
+  seen.stdout = snapshot([completed])
+  await clock.advance(4_000)
+  expect(seen.toasts).toEqual(['Codex review finished in 1m 5s. /codex:result review-abc'])
+})
+
+test('a job that starts and finishes between polls is still announced', async ($, on) => {
+  const clock = mock.clock(on)
+  const seen = world(on)
+
+  seen.stdout = snapshot([])
+  await $.tool.call({ tool: 'Bash', command: COMPANION })
+  await clock.settle()
+
+  seen.stdout = snapshot([completed])
+  await clock.advance(4_000)
+  expect(seen.toasts).toEqual(['Codex review finished in 1m 5s. /codex:result review-abc'])
+
+  await clock.advance(4_000)
+  expect(seen.toasts.length).toBe(1)
+})
+
+test('history in the first snapshot is not announced', async ($, on) => {
+  const clock = mock.clock(on)
+  const seen = world(on)
+
+  seen.stdout = snapshot([completed])
+  await $.tool.call({ tool: 'Bash', command: COMPANION })
+  await clock.advance(10_000)
+  expect(seen.toasts).toEqual([])
 })
 
 test('system notifications follow the plugin option', { options: { systemNotifications: false } }, async ($, on) => {
