@@ -1,10 +1,9 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { nowIso, readStoredJob, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { nowIso, readStoredJob, resolveJobLogFile, SESSION_ID_ENV, upsertJob, writeJobFile } from "./state.mjs";
 
-export { nowIso };
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+export { nowIso, SESSION_ID_ENV };
 
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {

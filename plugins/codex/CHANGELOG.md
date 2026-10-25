@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 — 2026-10-25
+
+- Add live Codex job status to Claude Code (terminal and desktop):
+  - a status line entry while reviews and rescues run
+  - a toast when a job finishes, fails, or is cancelled, plus a system
+    notification in the terminal for jobs that ran 30 seconds or longer (the
+    `systemNotifications` option turns notifications off)
+  - a `/codex-jobs` pane with per-job Cancel, Result, and Copy resume actions
+  It is built on Claude Code's hooks module API (early access, validated with
+  2.1.310) and reads the same job records as `/codex:status`.
+- The `SessionStart` hook records the plugin data directory for the session,
+  so companion calls without `CLAUDE_PLUGIN_DATA` (as from the hooks module)
+  resolve the same job state. The record is trusted only when it is owned by
+  the current user and not group- or world-writable, and `SessionEnd` removes it.
+- Add `npm run test:mod`, which runs `claude plugin validate` and `claude plugin test`.
+
 ## 1.1.0 — 2026-10-25
 
 - Update examples for current Codex models and rename the internal prompting skill

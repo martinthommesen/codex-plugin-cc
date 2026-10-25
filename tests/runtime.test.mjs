@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex, readFakeCodexState } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run, takeCreatedTempDirs } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { readSessionPointer, removeSessionPointer, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -818,11 +818,44 @@ test("session start hook exports the Claude session id, transcript path, and plu
     })
   });
 
+  // The hook also records a session pointer; other tests reuse this id.
+  removeSessionPointer("sess-current");
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     fs.readFileSync(envFile, "utf8"),
     `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
   );
+});
+
+test("session hooks record and remove the plugin data dir for the live-status module", () => {
+  const repo = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const sessionId = `sess-pointer-${process.pid}-${Date.now()}`;
+  const hookEnv = { ...process.env, CLAUDE_PLUGIN_DATA: pluginDataDir };
+  delete hookEnv.CLAUDE_ENV_FILE;
+
+  const started = run("node", [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: hookEnv,
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: sessionId, cwd: repo })
+  });
+  assert.equal(started.status, 0, started.stderr);
+  assert.equal(readSessionPointer(sessionId), pluginDataDir);
+
+  // The module calls the companion with the session id alone, no CLAUDE_PLUGIN_DATA.
+  const moduleEnv = { ...process.env, CODEX_COMPANION_SESSION_ID: sessionId };
+  delete moduleEnv.CLAUDE_PLUGIN_DATA;
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: moduleEnv });
+  assert.equal(status.status, 0, status.stderr);
+  assert.deepEqual(JSON.parse(status.stdout).running, []);
+
+  const ended = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: hookEnv,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: sessionId, cwd: repo })
+  });
+  assert.equal(ended.status, 0, ended.stderr);
+  assert.equal(readSessionPointer(sessionId), null);
 });
 
 test("write task output focuses on the Codex result without generic follow-up hints", () => {

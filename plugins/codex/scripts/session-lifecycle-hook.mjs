@@ -7,7 +7,15 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import { clearBrokerSession, loadBrokerSession, sendBrokerShutdown, teardownBrokerSession } from "./lib/broker-lifecycle.mjs";
 import { readJsonStdin } from "./lib/fs.mjs";
-import { isActiveJob, loadState, PLUGIN_DATA_ENV, resolveStateFile, saveState } from "./lib/state.mjs";
+import {
+  isActiveJob,
+  loadState,
+  PLUGIN_DATA_ENV,
+  removeSessionPointer,
+  resolveStateFile,
+  saveState,
+  writeSessionPointer
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -62,6 +70,11 @@ function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+  try {
+    writeSessionPointer(input.session_id, process.env[PLUGIN_DATA_ENV]);
+  } catch {
+    // The live-status module falls back to the temp state root without it.
+  }
 }
 
 async function handleSessionEnd(input) {
@@ -73,7 +86,9 @@ async function handleSessionEnd(input) {
     await sendBrokerShutdown(brokerSession.endpoint);
   }
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  cleanupSessionJobs(cwd, sessionId);
+  removeSessionPointer(sessionId);
   teardownBrokerSession({ ...brokerSession, killProcess: terminateProcessTree });
   clearBrokerSession(cwd);
 }

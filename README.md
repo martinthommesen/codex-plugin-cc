@@ -12,6 +12,7 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- live job status: a status line entry while Codex works, a toast (and, in the terminal, a system notification for long jobs) when a job finishes, and a `/codex-jobs` pane to cancel, open, or resume jobs
 
 ## Requirements
 
@@ -20,6 +21,7 @@ they already have.
 - **Node.js 22 or later** (Node.js 24 LTS recommended)
 - **A current Codex CLI**. This release is validated against Codex 0.164.0.
 - **Claude Code with plugin support**. Manifest validation was checked with Claude Code 2.1.310.
+  Live job status uses Claude Code's hooks module API (early access), validated with 2.1.310.
 
 ## Install
 
@@ -34,6 +36,8 @@ Install the plugin:
 ```bash
 /plugin install codex@openai-codex
 ```
+
+In the desktop app, where `/plugin` doesn't run: click **+** next to the prompt box, then **Plugins**. Choose **Add marketplace**, enter `openai/codex-plugin-cc`, then **Add plugin**.
 
 Reload plugins:
 
@@ -65,6 +69,7 @@ After install, you should see:
 
 - the slash commands listed below
 - the `codex:codex-rescue` subagent in `/agents`
+- `/codex-jobs` in the command list
 
 One simple first run is:
 
@@ -269,6 +274,21 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 > [!WARNING]
 > The review gate uses additional Codex capacity on each normal stop. It skips repeat stops while Claude is responding to stop-hook feedback to avoid a review loop.
 
+### Live job status and `/codex-jobs`
+
+You don't have to poll `/codex:status` while Codex works. In the terminal and in the desktop app:
+
+- **Status line.** While a review or rescue runs, a `codex: review reviewing 1m 12s` entry sits under the prompt. With several jobs it reads `codex: 2 jobs running`.
+- **Completion alerts.** When a job finishes, fails, or is cancelled, a toast names the job and the follow-up command, such as `/codex:result review-…`. If the job ran 30 seconds or longer and you're in the terminal, you also get a system notification through your configured notification channel. The desktop app doesn't receive these.
+- **`/codex-jobs` pane.** Opens a live panel beside the chat. It lists this session's jobs with their phase, duration, summary, and latest progress lines. Each job has buttons:
+  - **Cancel** for running jobs
+  - **Result** for finished jobs, which runs `/codex:result <id>`
+  - **Copy resume**, which copies `codex resume <thread-id>` so you can continue in Codex
+
+To turn system notifications off, open `/config` and set the plugin's **System notifications** option to off. Toasts and the status line stay on.
+
+The pane and status line read the same job records as `/codex:status`. The plugin checks once when an interactive session starts. After that it polls only while a Codex job is running, or briefly after a companion command.
+
 ## Typical Flows
 
 ### Review Before Shipping
@@ -358,10 +378,17 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 npm ci
 npm run check-version
 npm test
+npm run test:mod
 npm run build
 claude plugin validate plugins/codex
 claude plugin validate .
 ```
+
+`npm run test:mod` validates and tests the live-status hooks module
+(`plugins/codex/hooks/register.tsx`) with `claude plugin test`. It needs the
+`claude` CLI, so CI does not run it. To try the module interactively, start
+`claude --plugin-dir ./plugins/codex`. Edits reload when the turn ends, and
+Claude Code writes the API types to `plugins/codex/.claude-plugin/types/`.
 
 The development dependency pins Codex 0.164.0 so protocol type generation and
 native import tests are reproducible. Installed plugins continue to use the

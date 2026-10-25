@@ -5,7 +5,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  readSessionPointer,
+  removeSessionPointer,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  writeSessionPointer
+} from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +111,66 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+function withEnv(overrides, body) {
+  const previous = Object.fromEntries(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value == null) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    return body();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+test("resolveStateDir follows the session pointer when CLAUDE_PLUGIN_DATA is missing", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const sessionId = `sess-state-${process.pid}-${Date.now()}`;
+  const pointerFile = writeSessionPointer(sessionId, pluginDataDir);
+
+  try {
+    assert.equal(fs.statSync(pointerFile).mode & 0o777, 0o600);
+    const stateDir = withEnv({ CLAUDE_PLUGIN_DATA: null, CODEX_COMPANION_SESSION_ID: sessionId }, () =>
+      resolveStateDir(workspace)
+    );
+    assert.equal(stateDir.startsWith(path.join(pluginDataDir, "state")), true);
+
+    const withoutSession = withEnv({ CLAUDE_PLUGIN_DATA: null, CODEX_COMPANION_SESSION_ID: null }, () =>
+      resolveStateDir(workspace)
+    );
+    assert.equal(withoutSession.startsWith(os.tmpdir()), true);
+  } finally {
+    removeSessionPointer(sessionId);
+  }
+  assert.equal(fs.existsSync(pointerFile), false);
+});
+
+test("readSessionPointer ignores pointers others could have written", () => {
+  const sessionId = `sess-shared-${process.pid}-${Date.now()}`;
+  const pointerFile = writeSessionPointer(sessionId, makeTempDir());
+
+  try {
+    fs.chmodSync(pointerFile, 0o622);
+    assert.equal(readSessionPointer(sessionId), null);
+    fs.chmodSync(pointerFile, 0o600);
+    fs.writeFileSync(pointerFile, JSON.stringify({ pluginDataDir: "relative/dir" }));
+    assert.equal(readSessionPointer(sessionId), null);
+  } finally {
+    removeSessionPointer(sessionId);
+  }
+  assert.equal(writeSessionPointer(sessionId, "relative/dir"), null);
+  assert.equal(readSessionPointer(""), null);
 });
